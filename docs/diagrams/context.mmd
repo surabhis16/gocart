@@ -1,0 +1,28 @@
+flowchart TB
+    cust([Customer])
+    admin([Admin])
+
+    subgraph order_ctx [Order bounded context]
+        direction TB
+        oapi[HTTP API]
+        osvc[Commands: decide,<br/>append, coordinate]
+        elog[(Event log<br/>file or Cassandra)]
+        proj[Read model<br/>in memory, rebuilt from the log]
+        oapi -->|commands| osvc
+        osvc -->|append| elog
+        elog -.->|replay at startup| proj
+        osvc -.->|apply each new event| proj
+        oapi -->|queries| proj
+    end
+
+    subgraph product_ctx [Product bounded context]
+        direction TB
+        papi[HTTP API]
+        cat[(Catalogue and reservations<br/>catalog.json)]
+        papi --> cat
+    end
+
+    cust -->|place, cancel, look up| oapi
+    admin -->|ship| oapi
+    admin -->|add products, restock| papi
+    osvc ==>|reserve / release,<br/>retried safely| papi

@@ -1,0 +1,385 @@
+openapi: 3.0.3
+info:
+  title: GoCart Product Service
+  version: 0.1.0
+  description: |
+    The Product bounded context: the catalogue, and the stock that other
+    services reserve against it.
+
+    **Money** is always an integer in the smallest currency unit (paise), never
+    a float.
+
+    **Reservations are all-or-nothing and idempotent per `order_id`.** Repeating
+    the same `POST /reservations` returns the original reservation and does not
+    touch stock, so a caller that timed out can safely retry. Reusing an
+    `order_id` with different items is a conflict.
+
+    **Errors** are RFC 9457 problem documents (`application/problem+json`).
+    The `type` member is a URN, listed under `Problem`.
+servers:
+  - url: http://localhost:8080
+    description: Local (docker compose or `go run`)
+tags:
+  - name: catalogue
+    description: Browse and maintain products. Used by customers (read) and admins (write).
+  - name: stock
+    description: Reserve and release stock. Called by the Order service, not by end users.
+  - name: ops
+    description: Operational endpoints.
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /products:
+    get:
+      tags: [catalogue]
+      operationId: listProducts
+      summary: List the whole catalogue
+      description: The catalogue is small by design, so the list is not paginated.
+      responses:
+        "200":
+          description: Every product, ordered by id.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Product"
+    post:
+      tags: [catalogue]
+      operationId: createProduct
+      summary: Add a product (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewProduct"
+      responses:
+        "201":
+          description: Created. The new product's URL is in `Location`.
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /products/prd_1a2b3c4d
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /products/{id}:
+    get:
+      tags: [catalogue]
+      operationId: getProduct
+      summary: Get one product
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+      responses:
+        "200":
+          description: The product, including current stock.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /products/{id}/stock:
+    put:
+      tags: [catalogue]
+      operationId: setStock
+      summary: Set a product's stock level (admin restock)
+      description: Sets the absolute level. It does not touch stock already reserved.
+      parameters:
+        - $ref: "#/components/parameters/ProductId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stock]
+              additionalProperties: false
+              properties:
+                stock:
+                  type: integer
+                  minimum: 0
+                  maximum: 1000000
+                  example: 50
+      responses:
+        "200":
+          description: The updated product.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /reservations:
+    post:
+      tags: [stock]
+      operationId: reserveStock
+      summary: Reserve stock for an order, all lines or none
+      description: |
+        Atomically holds stock for every line. If any line cannot be satisfied
+        nothing is reserved and the response lists each shortage.
+
+        The returned lines carry the name and unit price **at the moment of
+        reservation**, which is the price the customer is charged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReserveRequest"
+      responses:
+        "201":
+          description: Stock reserved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reservation"
+        "200":
+          description: This `order_id` already holds exactly these items. Nothing changed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reservation"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "409":
+          description: |
+            Either not enough stock (`insufficient-stock`, with a `shortages`
+            member) or the order already holds different items
+            (`reservation-mismatch`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: |
+            The request is invalid, or names products that do not exist
+            (`unknown-product`, with a `product_ids` member).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /reservations/{order_id}:
+    delete:
+      tags: [stock]
+      operationId: releaseStock
+      summary: Release an order's reserved stock
+      description: |
+        Returns the stock to the shelf. Idempotent: releasing an order that
+        holds nothing is also a `204`, so compensation can be retried freely.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "204":
+          description: Released, or there was nothing to release.
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+components:
+  parameters:
+    ProductId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        example: prd_keyboard
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9_-]{1,64}$"
+        example: ord_9f2c41d0a7b35e68
+  responses:
+    MalformedBody:
+      description: The body is not valid JSON, has unknown fields, or is trailing garbage.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationFailed:
+      description: The request was understood but breaks a rule. `detail` says which.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: No such product.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Product:
+      type: object
+      required: [id, name, description, price_minor, currency, stock]
+      properties:
+        id:
+          type: string
+          example: prd_keyboard
+        name:
+          type: string
+          example: Mechanical Keyboard (Tenkeyless)
+        description:
+          type: string
+        price_minor:
+          type: integer
+          format: int64
+          description: Price in paise.
+          example: 499900
+        currency:
+          type: string
+          example: INR
+        stock:
+          type: integer
+          description: Units available to reserve right now.
+          example: 25
+    NewProduct:
+      type: object
+      required: [name, price_minor]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 1000
+        price_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000000
+        stock:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+    Line:
+      type: object
+      required: [product_id, quantity]
+      additionalProperties: false
+      properties:
+        product_id:
+          type: string
+          example: prd_keyboard
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 2
+    ReserveRequest:
+      type: object
+      required: [order_id, items]
+      additionalProperties: false
+      properties:
+        order_id:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{1,64}$"
+          example: ord_9f2c41d0a7b35e68
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: One entry per product; combine quantities rather than repeating a product.
+          items:
+            $ref: "#/components/schemas/Line"
+    ReservedLine:
+      type: object
+      required: [product_id, name, quantity, unit_price_minor]
+      properties:
+        product_id:
+          type: string
+        name:
+          type: string
+        quantity:
+          type: integer
+        unit_price_minor:
+          type: integer
+          format: int64
+    Reservation:
+      type: object
+      required: [order_id, currency, items, reserved_at]
+      properties:
+        order_id:
+          type: string
+        currency:
+          type: string
+          example: INR
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReservedLine"
+        reserved_at:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem details. `type` is one of `urn:gocart:problem:` followed
+        by `invalid-request`, `validation-failed`, `not-found`,
+        `insufficient-stock`, `unknown-product`, `reservation-mismatch`,
+        `payload-too-large` or `internal`. Extension members depend on the type.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          example: urn:gocart:problem:insufficient-stock
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        request_id:
+          type: string
+          description: Quote this when reporting a problem; it appears in the service logs.
+        shortages:
+          type: array
+          description: Present on `insufficient-stock`.
+          items:
+            type: object
+            properties:
+              product_id:
+                type: string
+              requested:
+                type: integer
+              available:
+                type: integer
+        product_ids:
+          type: array
+          description: Present on `unknown-product`.
+          items:
+            type: string

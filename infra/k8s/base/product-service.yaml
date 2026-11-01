@@ -1,0 +1,87 @@
+# Product service. One replica with a Recreate rollout, on purpose: its state is
+# a single file on a volume, and a file has exactly one writer. Scaling this out
+# means moving its data to a database first; see docs/operations.md.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: product-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  labels:
+    app.kubernetes.io/name: product-service
+    app.kubernetes.io/component: catalog
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: product-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: product-service
+        app.kubernetes.io/component: catalog
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: product-service
+          image: gocart/product-service:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - { name: PORT, value: "8080" }
+            - { name: DATA_DIR, value: /data }
+            - { name: LOG_LEVEL, value: info }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: product-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+  labels:
+    app.kubernetes.io/name: product-service
+spec:
+  selector:
+    app.kubernetes.io/name: product-service
+  ports:
+    - { name: http, port: 8080, targetPort: http }

@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gocart-staging
+resources:
+  - ../staging
+  - ../../cassandra
+images:
+  # The Cassandra-enabled build is a different binary, so it is a different tag.
+  - name: localhost:5000/gocart/order-service
+    newTag: 0.1.0-cassandra
+patches:
+  - target:
+      kind: Deployment
+      name: order-service
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: EVENT_STORE, value: cassandra }
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: CASSANDRA_HOSTS, value: cassandra }
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: CASSANDRA_KEYSPACE, value: gocart }

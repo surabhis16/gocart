@@ -1,0 +1,95 @@
+# Order service. One replica, on purpose, for two separate reasons:
+#   * the default event store is a file, which has exactly one writer;
+#   * the read model (the "Q" of CQRS) lives in memory and is updated by the
+#     commands this same process handles, so a second replica would answer
+#     queries from a view that never sees the first one's orders. Scaling reads
+#     needs a change feed from the event store, which is out of scope here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: order-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels:
+    app.kubernetes.io/name: order-service
+    app.kubernetes.io/component: checkout
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order-service
+        app.kubernetes.io/component: checkout
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: order-service
+          image: gocart/order-service:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - { name: PORT, value: "8081" }
+            - { name: DATA_DIR, value: /data }
+            - { name: LOG_LEVEL, value: info }
+            - { name: PRODUCT_URL, value: "http://product-service:8080" }
+            - { name: RECONCILE_INTERVAL, value: 5s }
+          # Readiness deliberately does not check the Product service: an order
+          # placed while it is down is still accepted (202) and finished later,
+          # so being unable to reach Product is not a reason to stop taking orders.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { memory: 192Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: order-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  labels:
+    app.kubernetes.io/name: order-service
+spec:
+  selector:
+    app.kubernetes.io/name: order-service
+  ports:
+    - { name: http, port: 8081, targetPort: http }

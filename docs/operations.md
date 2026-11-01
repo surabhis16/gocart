@@ -1,0 +1,252 @@
+# Running, deploying and changing GoCart
+
+Everything here is free to run. Nothing needs a cloud account, a licence key or a credit card.
+
+| Tool | Used for | Cost |
+|---|---|---|
+| Go 1.22 or newer | building and testing | free, open source |
+| Docker (Engine, or Docker Desktop) | containers, Compose | free; Docker Desktop is free for personal and educational use |
+| minikube + kubectl | local Kubernetes | free, open source |
+| Terraform (or OpenTofu) | infrastructure as code | free to use; Terraform is source-available (BSL), and **OpenTofu** is the open-source drop-in, where you type `tofu` for `terraform` |
+| GitHub Actions + ghcr.io | CI and the container registry | free for public repositories; private repositories get a free monthly allowance |
+| LocalStack, AWS | **not used** | see [Infrastructure as code](#infrastructure-as-code-unit-iii) |
+
+## Run it
+
+### Fastest: Docker Compose
+
+```
+docker compose up --build
+```
+
+Product is on <http://localhost:8080>, Order on <http://localhost:8081>. The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
+
+```
+curl -s localhost:8080/products | python3 -m json.tool
+
+curl -s -X POST localhost:8081/orders \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
+  -d '{"customer_id":"cust_asha","items":[{"product_id":"prd_keyboard","quantity":2}]}'
+```
+
+Then look at what was actually stored, which is the event-sourcing demo:
+
+```
+curl -s localhost:8081/orders/<id-from-above>/events | python3 -m json.tool
+```
+
+Two scripts exercise it end to end (use a fresh stack: `docker compose down -v`):
+
+- `./scripts/smoke.sh`: 26 checks across both services: confirmed, retried, rejected, cancelled, refused.
+- `./scripts/outage-demo.sh`: stops the Product service mid-flow, places an order, brings Product back, and watches the order complete itself.
+
+### Without Docker
+
+```
+(cd product-service && go run .)                       # :8080
+(cd order-service   && go run .)                       # :8081
+```
+
+Data goes to `./data` in each directory. Configuration is by environment variable; the full list is at the top of each `main.go`.
+
+### Tests
+
+```
+make test
+```
+
+Format check, `go vet` and the race detector for both services: 76 tests (97 counting subtests). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
+
+## Developer workspace (Unit IV)
+
+**Coding standards** are enforced by the machine instead of by review comments: CI fails on anything `gofmt` would change, on `go vet` findings, and on any data race (`go test -race`). Each service is a standard Go layout: `main.go` for wiring, `internal/` for everything else, so nothing outside a service can import its internals.
+
+**A containerised environment locally** is `docker-compose.yml`. Each Dockerfile is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
+
+### Cassandra
+
+The Order service stores its events in a file by default. To use Cassandra instead:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.cassandra.yml up --build
+```
+
+This builds the Order service with `-tags cassandra`, starts a single Cassandra node (heap capped for laptops, about 1.5 GB of memory in all), and points the Order service at it. The first start is slow because Cassandra takes a minute or more to boot; the Order service waits for it and creates its own keyspace and table.
+
+How the Cassandra store works is in `order-service/internal/eventstore/cassandra.go`: one partition per order, one row per event, and `INSERT ... IF NOT EXISTS` (a lightweight transaction) so that of any number of writers racing to append the same version of the same order, exactly one wins.
+
+> **Read this about verification.** The Cassandra store is the one part of this project I could not compile against the real driver or run: my build environment could not download Go modules or pull images. I type-checked the code against a stub of the driver API, and the file store and Cassandra store are held to *one shared test suite* (`contract_test.go`). The CI job `cassandra-event-store` compiles it against the real driver and runs that suite against a live Cassandra. **Until that job is green, treat the Cassandra store as untested.** To run it yourself:
+>
+> ```
+> docker run -d --name cass -p 9042:9042 cassandra:5.0      # wait about a minute
+> cd order-service
+> go get github.com/apache/cassandra-gocql-driver/v2@v2.0.0 && go mod tidy
+> go vet -tags cassandra ./...
+> CASSANDRA_TEST_HOSTS=127.0.0.1 go test -tags cassandra -v -run Cassandra ./internal/eventstore
+> ```
+>
+> If `go vet -tags cassandra` reports a signature mismatch against the driver, that is the thing to fix, and it will point at the exact line.
+
+### Kubernetes
+
+Two ways to run on a local cluster, both under `infra/k8s/` and built with Kustomize (included in `kubectl`):
+
+| Overlay | For | Images come from |
+|---|---|---|
+| `overlays/local` | Docker Desktop's Kubernetes, or minikube with `minikube image load` | images already on the node |
+| `overlays/staging` | minikube, the full shipping flow below | a registry inside the cluster |
+| `overlays/staging-cassandra` | staging, plus Cassandra and the Order service switched over | same |
+
+```
+docker compose build
+kubectl apply -k infra/k8s/overlays/local
+kubectl -n gocart-local get pods
+```
+
+The manifests make a few choices on purpose; each is commented in the YAML:
+
+- **One replica each, with a `Recreate` rollout.** State is a file with one writer; see the [limits table](architecture.md#known-limits).
+- **The Order service's readiness probe does not check the Product service.** If it did, a Product outage would take Order out of rotation, and the whole design is that Order keeps accepting orders during one.
+- **Hardened pods:** non-root, read-only root filesystem, all capabilities dropped, default seccomp profile, resource limits.
+- **Cassandra** is a one-node StatefulSet with a headless Service and a volume claim template.
+
+`python3 scripts/check-k8s.py` validates all of it without a cluster: every object against the Kubernetes 1.31 API schemas (unknown fields are errors), then selector/label matches, probe ports, Service targets, overlay references and image tags against `VERSION`.
+
+## Infrastructure as code (Unit III)
+
+### DevOps principles, in this repository
+
+| Principle | Where |
+|---|---|
+| Everything is in version control, including infrastructure | `infra/` |
+| Every change is built and tested automatically | `.github/workflows/ci.yml` |
+| The pipeline is the only path to a release | tag `v*` triggers `release.yml` |
+| Small, frequent, reversible changes | one `VERSION`, one-command bump (`scripts/bump-version.sh`), idempotent operations |
+| Environments are reproducible | `docker compose up`, `kubectl apply -k` |
+| Know when it is broken | structured JSON logs, a request ID across both services, health endpoints |
+
+### Terraform
+
+`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) per service, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
+
+There is deliberately **no VPC, load balancer or cluster**. Those are the expensive parts of AWS, and this project runs on a laptop. The practice, which is what Unit III teaches, is infrastructure described in files, reviewed, planned, and applied by a pipeline.
+
+**You can run `plan` for free with no AWS account.** The `offline` variable (default `true`) gives the AWS provider throw-away credentials and tells it not to look anything up. Nothing in the configuration reads from AWS, so the plan is complete:
+
+```
+make tf-plan
+```
+
+or, step by step:
+
+```
+cd infra/terraform
+terraform init -backend=false
+terraform validate
+terraform plan -var offline=true
+```
+
+By my count the plan should show 7 resources to add: 2 repositories, 2 lifecycle policies, 2 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). Check that against the real output before quoting it; I have not seen it.
+
+> **What I did and did not verify.** `terraform` was not available in my environment, so I did not run `validate` or `plan`. I parsed all four files as HCL and checked by script that every `var.`, `local.`, resource and data reference resolves to something declared, and that nothing declared is unused. The CI job `infrastructure` runs `terraform fmt -check`, `init`, `validate` and `plan`; **that is the real verification, and I have not seen it pass.** Applying to real AWS needs an account and `-var offline=false`; I have not done that and I am not claiming the configuration applies cleanly. Free-tier LocalStack was not used, because I could not confirm that its free edition supports ECR.
+
+### The pipeline
+
+`ci.yml` runs four jobs on every push and pull request:
+
+| Job | What it checks |
+|---|---|
+| `test` | per service: `gofmt`, `go vet`, `go test -race` (including the OpenAPI drift test) |
+| `cassandra-event-store` | compiles the Cassandra store and runs the shared contract suite against a live Cassandra |
+| `infrastructure` | `terraform fmt/validate/plan`, the Kubernetes check, both compose files |
+| `end-to-end` | builds both images, starts the stack, runs `smoke.sh`, then runs the outage demo |
+
+## Releasing (Unit V)
+
+### The staging environment, shipping and deploying
+
+```
+./scripts/ship.sh               # or: ./scripts/ship.sh cassandra
+```
+
+This is the whole path from source to a running staging environment:
+
+1. confirms the manifests agree on the version in `VERSION`;
+2. enables minikube's `registry` addon, a registry running inside the cluster;
+3. opens it on `localhost:5000` on your machine;
+4. builds both images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
+5. applies the `staging` overlay into the `gocart-staging` namespace, which makes the cluster pull the *same name* from its own registry;
+6. waits for each rollout, then prints how to reach it.
+
+Then `./scripts/smoke.sh` against the forwarded ports, or the outage demo using `kubectl scale` as the way to take Product away (the exact commands are printed).
+
+For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build both images and publish them to GitHub's free container registry, `ghcr.io`.
+
+`scripts/bump-version.sh 0.2.0` changes the version everywhere it is written (the `VERSION` file, the manifests, the compose defaults) and re-runs the consistency check. Left to hand edits, those drift apart and staging quietly runs a different image than the one you just shipped. I tested it by bumping up, bumping back, and confirming the tree is byte-identical to where it started.
+
+> **Not run here.** `ship.sh` needs minikube and a Docker daemon, neither available in my environment. It passes `shellcheck` and `bash -n`, and the manifests it applies pass the schema check, but I have not seen it run end to end. The most likely thing to need adjusting is the registry port-forward, which behaves slightly differently across operating systems and minikube drivers. The comments in the script explain the mechanism so you can debug it.
+
+### Clean up
+
+```
+./scripts/cleanup.sh
+```
+
+Deletes the `gocart-staging` and `gocart-local` namespaces (which removes Deployments, Services, volumes and Cassandra with them), stops the registry port-forward, removes the local images, and runs `docker compose down -v`. "Clean up" should leave nothing running.
+
+## Managing change (Unit V)
+
+Changes to a microservices system are mostly changes to *contracts* between services, since each service's insides can change freely. Here are the kinds of change, and what GoCart does for each.
+
+### Additive change: no coordination needed
+
+Suppose the Product service adds an optional field (say `sku`) to its responses. The Order service must keep working with no change and no release. That works because the two sides are deliberately asymmetric:
+
+- **The Order service reads Product's responses tolerantly.** It ignores fields it does not know. `TestReserveSuccessIgnoresFieldsItDoesNotKnow` puts `some_future_field` in a response and checks nothing breaks.
+- **The Product service reads requests strictly.** It rejects unknown fields (`TestStrictBodyParsing`). Silently ignoring a misspelt field is how `"quantity"` becomes `0`, so for input it is better to fail loudly.
+
+This is Postel's law applied in the right direction: strict about what you accept from untrusted callers, tolerant of what you receive from a service you depend on.
+
+### Breaking change: run both versions side by side
+
+Suppose the Product service must rename `price_minor`. GoCart has no `/v1` prefix yet; the first breaking change is when one appears. The safe sequence is *expand, migrate, contract*:
+
+1. **Expand.** Add `POST /v2/reservations` next to the existing `/reservations`. Both are live. Nothing breaks.
+2. **Migrate.** Release the Order service to call `/v2`. Because both exist, the two services can release in either order, which is the point.
+3. **Contract.** When no traffic reaches the old path (the access log shows this: every request has path and status), delete it.
+
+At no step do two teams need to deploy together.
+
+### Change to stored data: events are forever
+
+The Order service's events are history and are never edited. The rules the code already enforces:
+
+- Adding an *optional* field to an event is safe: old events simply lack it.
+- Changing the *meaning* of an event is not. Add a new event type instead.
+- Reading an event type the code does not know **refuses to start** (`TestApplyRefusesDamagedHistory`). That is the right behaviour if an old binary meets a newer log: silently skipping an event would change what an order is. The cost is that you cannot roll the Order service back past a release that introduced a new event type without migrating the log. Know that before you ship one.
+
+### Change under failure: retries must be safe
+
+Every operation that crosses a network is idempotent, which turns "the network lost the reply" from a data-corruption problem into a non-event: `Idempotency-Key` for customers, per-order-ID reservation and release between services. [architecture.md](architecture.md#orders-are-a-small-saga) has the detail.
+
+## Measuring progress (Unit V)
+
+The syllabus asks how to tell whether adopting microservices is working. The honest answer is to measure *flow and coordination*, not the number of services. The four standard delivery metrics (from the DORA research), and where each comes from in this repository:
+
+| Metric | What it tells you | Source here |
+|---|---|---|
+| **Deployment frequency** | How often you can safely ship | count of `v*` tags and `release.yml` runs |
+| **Lead time for changes** | Commit to running in staging | CI run time plus `ship.sh` duration |
+| **Change failure rate** | How often a release breaks something | red `end-to-end` runs on `main` / total |
+| **Time to restore** | How fast service comes back | measured: 10.2 s from `OrderPlaced` to `OrderConfirmed` in the outage demo (1 s reconcile interval) |
+
+And two that matter specifically for *this* architecture, because reducing coordination is its whole premise:
+
+- **Cross-team changes per release:** how many releases needed more than one team to change something. It should trend towards zero, and a service whose changes always drag another service along is the sign of a boundary in the wrong place.
+- **Splits and merges:** per the sizing formula, a healthy system keeps splitting where coordination hurts. Track *why* each boundary moved.
+
+A team that ships twice a day to two services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
+
+## Complexity and simplification
+
+Microservices do not remove complexity, they move it: from inside a codebase to between services, where it is harder to see. GoCart's wager is that two services is the least that demonstrates the benefits, and the cost is visible in the code: the saga, the reconciler, idempotency and retries are exactly the complexity that a single process gets for free from a transaction. Anything added to a boundary should earn its place against that bill.

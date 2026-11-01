@@ -1,0 +1,40 @@
+# Overlay: store the Order service's events in Cassandra instead of a file.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cassandra.yml up --build
+#
+# The first start is slow: Cassandra needs a minute or more to boot. The Order
+# service waits for it and creates its own keyspace and table.
+#
+# Needs roughly 1.5 GB of free memory. The heap is capped below for laptops.
+services:
+  cassandra:
+    image: cassandra:5.0
+    environment:
+      CASSANDRA_CLUSTER_NAME: gocart
+      MAX_HEAP_SIZE: 512M # Cassandra requires these two to be set together
+      HEAP_NEWSIZE: 128M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  order-service:
+    build:
+      args:
+        TAGS: cassandra # compiles the Cassandra event store into the binary
+    image: gocart/order-service:${VERSION:-0.1.0}-cassandra
+    environment:
+      EVENT_STORE: cassandra
+      CASSANDRA_HOSTS: cassandra
+      CASSANDRA_KEYSPACE: gocart
+    depends_on:
+      cassandra:
+        condition: service_healthy
+
+volumes:
+  cassandra-data:

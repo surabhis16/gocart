@@ -1,0 +1,20 @@
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant O as Order service
+    participant L as Event log
+    participant P as Product service
+
+    C->>O: POST /orders
+    O->>L: append OrderPlaced (v1)
+    O-xP: POST /reservations
+    Note over P: down
+    O-->>C: 202 Accepted, status placed
+
+    Note over O,L: every few seconds the reconciler<br/>looks for orders that are still placed
+    Note over P: comes back
+    O->>P: POST /reservations  (same order id)
+    P-->>O: 201 reserved (exactly once)
+    O->>L: append OrderConfirmed (v2)
+    C->>O: GET /orders/{id}
+    O-->>C: 200, status confirmed

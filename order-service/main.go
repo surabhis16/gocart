@@ -1,0 +1,154 @@
+// Command order-service runs the GoCart Order bounded context.
+//
+// Configuration comes from the environment:
+//
+//	PORT                 listen port                               (default 8081)
+//	PRODUCT_URL          base URL of the Product service           (default http://localhost:8080)
+//	EVENT_STORE          file | cassandra                          (default file)
+//	DATA_DIR             where events.log is kept (file store)     (default ./data)
+//	CASSANDRA_HOSTS      comma-separated contact points            (cassandra store)
+//	CASSANDRA_KEYSPACE   keyspace holding order_events             (default gocart)
+//	RECONCILE_INTERVAL   how often unfinished orders are retried   (default 5s)
+//	LOG_LEVEL            debug | info | warn | error               (default info)
+//
+// The cassandra store is compiled in only with `-tags cassandra`.
+//
+// Run with -healthcheck to probe a running instance and exit 0 or 1. The
+// container image is built FROM scratch, so there is no curl to do it for us.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"gocart/order-service/internal/eventstore"
+	"gocart/order-service/internal/httpapi"
+	"gocart/order-service/internal/productclient"
+	"gocart/order-service/internal/service"
+)
+
+// version is stamped at build time: -ldflags "-X main.version=1.2.3".
+var version = "dev"
+
+func main() {
+	healthcheck := flag.Bool("healthcheck", false, "probe /healthz on this machine and exit 0 if healthy, 1 if not")
+	flag.Parse()
+
+	port := env("PORT", "8081")
+	if *healthcheck {
+		os.Exit(probe(port))
+	}
+
+	log := newLogger(env("LOG_LEVEL", "info"))
+	if err := run(log, port); err != nil {
+		log.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *slog.Logger, port string) error {
+	interval, err := time.ParseDuration(env("RECONCILE_INTERVAL", "5s"))
+	if err != nil || interval < time.Second {
+		return errors.New("RECONCILE_INTERVAL must be a duration of at least 1s, for example 5s")
+	}
+
+	store, err := openStore(log)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	products := productclient.New(env("PRODUCT_URL", "http://localhost:8080"))
+	svc, err := service.New(store, products, log)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go svc.RunReconciler(ctx, interval)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           httpapi.New(svc, log).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      20 * time.Second, // placing an order waits on the Product service
+		IdleTimeout:       60 * time.Second,
+	}
+
+	failed := make(chan error, 1)
+	go func() {
+		log.Info("order-service listening", "addr", srv.Addr, "version", version,
+			"event_store", env("EVENT_STORE", "file"), "product_url", env("PRODUCT_URL", "http://localhost:8080"))
+		failed <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-failed:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+	}
+
+	log.Info("shutting down; finishing in-flight requests")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
+}
+
+func openStore(log *slog.Logger) (eventstore.Store, error) {
+	switch kind := env("EVENT_STORE", "file"); kind {
+	case "file":
+		s, err := eventstore.OpenFile(env("DATA_DIR", "./data"))
+		if err != nil {
+			return nil, err
+		}
+		if s.RepairedBytes > 0 {
+			log.Warn("discarded a partial write left by a crash; it was never acknowledged", "bytes", s.RepairedBytes)
+		}
+		return s, nil
+	case "cassandra":
+		return openCassandra(log)
+	default:
+		return nil, errors.New(`EVENT_STORE must be "file" or "cassandra", got "` + kind + `"`)
+	}
+}
+
+func probe(port string) int {
+	c := http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
+}
+
+func newLogger(level string) *slog.Logger {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(level)); err != nil {
+		l = slog.LevelInfo
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l})).
+		With("service", "order-service")
+}
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}

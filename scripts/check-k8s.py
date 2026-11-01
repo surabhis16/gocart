@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Validate infra/k8s without a cluster.
+
+Checks every manifest against the real Kubernetes API schemas (strictly:
+unknown fields are errors), then the things a schema cannot catch: selectors
+that match their pods, probes that name real ports, Services that point at a
+workload, kustomize overlays whose references resolve, and image tags that
+agree with the VERSION file.
+
+    pip install kubernetes-validate pyyaml
+    python3 scripts/check-k8s.py
+"""
+import sys, pathlib, yaml, kubernetes_validate
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent / "infra" / "k8s"
+VERSION = "1.31"
+problems = []
+
+def docs(path):
+    return [d for d in yaml.safe_load_all(path.read_text()) if d]
+
+# 1. Every plain manifest validates against the real Kubernetes schemas.
+manifests = [ROOT/"base/product-service.yaml", ROOT/"base/order-service.yaml",
+             ROOT/"cassandra/cassandra.yaml", ROOT/"overlays/local/namespace.yaml",
+             ROOT/"overlays/staging/namespace.yaml"]
+n = 0
+for m in manifests:
+    for d in docs(m):
+        n += 1
+        try:
+            kubernetes_validate.validate(d, VERSION, strict=True)
+        except Exception as e:
+            problems.append(f"{m.relative_to(ROOT)}: {d.get('kind')}/{d['metadata']['name']}: {e}")
+print(f"schema-validated {n} objects against Kubernetes {VERSION} (strict: unknown fields are errors)")
+
+# 2. Things schemas cannot catch.
+by_kind = {}
+for m in manifests:
+    for d in docs(m):
+        by_kind.setdefault((d["kind"], d["metadata"]["name"]), d)
+
+for (kind, name), d in by_kind.items():
+    if kind not in ("Deployment", "StatefulSet"):
+        continue
+    sel = d["spec"]["selector"]["matchLabels"]
+    lab = d["spec"]["template"]["metadata"]["labels"]
+    if any(lab.get(k) != v for k, v in sel.items()):
+        problems.append(f"{kind}/{name}: selector {sel} does not match pod labels {lab}")
+    pod = d["spec"]["template"]["spec"]
+    for c in pod["containers"]:
+        ports = {p["name"] for p in c.get("ports", [])}
+        for probe in ("readinessProbe", "livenessProbe"):
+            p = c.get(probe, {}).get("httpGet")
+            if p and p["port"] not in ports:
+                problems.append(f"{kind}/{name}: {probe} uses port {p['port']!r}, container declares {sorted(ports)}")
+        mounts = {v["mountPath"]: v["name"] for v in c.get("volumeMounts", [])}
+        declared = {v["name"] for v in pod.get("volumes", [])} | {t["metadata"]["name"] for t in d["spec"].get("volumeClaimTemplates", [])}
+        for mp, vn in mounts.items():
+            if vn not in declared:
+                problems.append(f"{kind}/{name}: mounts volume {vn!r} that is not declared")
+        if kind == "Deployment" and "limits" not in c.get("resources", {}):
+            problems.append(f"{kind}/{name}: no resource limits")
+    for v in pod.get("volumes", []):
+        claim = v.get("persistentVolumeClaim", {}).get("claimName")
+        if claim and ("PersistentVolumeClaim", claim) not in by_kind:
+            problems.append(f"{kind}/{name}: references missing PVC {claim!r}")
+
+for (kind, name), d in by_kind.items():
+    if kind != "Service" or d["spec"].get("clusterIP") == "None" and False:
+        continue
+    sel = d["spec"]["selector"]
+    targets = [x for (k, _), x in by_kind.items() if k in ("Deployment", "StatefulSet")
+               and all(x["spec"]["template"]["metadata"]["labels"].get(a) == b for a, b in sel.items())]
+    if not targets:
+        problems.append(f"Service/{name}: selector {sel} matches no workload")
+    for t in targets:
+        ports = {p["name"] for c in t["spec"]["template"]["spec"]["containers"] for p in c.get("ports", [])}
+        for sp in d["spec"]["ports"]:
+            tp = sp.get("targetPort", sp["port"])
+            if isinstance(tp, str) and tp not in ports:
+                problems.append(f"Service/{name}: targetPort {tp!r} not exposed by {t['metadata']['name']}")
+
+# the Order service must be able to find the Product service by its Service name
+order = by_kind[("Deployment", "order-service")]["spec"]["template"]["spec"]["containers"][0]
+env = {e["name"]: e["value"] for e in order["env"]}
+if env["PRODUCT_URL"] != "http://product-service:8080":
+    problems.append(f"order-service PRODUCT_URL is {env['PRODUCT_URL']}")
+svc = by_kind[("Service", "product-service")]["spec"]["ports"][0]["port"]
+if svc != 8080:
+    problems.append(f"product-service Service port is {svc}, order-service calls 8080")
+
+# 3. Kustomizations: every referenced path exists, images name real images, and
+#    the JSON-patch path used by the cassandra overlay resolves in the base.
+def kust(p): return yaml.safe_load((ROOT/p/"kustomization.yaml").read_text())
+for p in ["base", "cassandra", "overlays/local", "overlays/staging", "overlays/staging-cassandra"]:
+    k = kust(p)
+    for r in k.get("resources", []):
+        t = (ROOT/p/r).resolve()
+        if not t.exists():
+            problems.append(f"{p}: resource {r} does not exist")
+        elif t.is_dir() and not (t/"kustomization.yaml").exists():
+            problems.append(f"{p}: {r} is a directory without a kustomization.yaml")
+
+base_images = {c["image"].rsplit(":", 1)[0]
+               for (kd, _), d in by_kind.items() if kd == "Deployment"
+               for c in d["spec"]["template"]["spec"]["containers"]}
+for im in kust("overlays/staging")["images"]:
+    if im["name"] not in base_images:
+        problems.append(f"overlays/staging renames {im['name']}, which no Deployment uses")
+renamed = {im["newName"] for im in kust("overlays/staging")["images"]}
+for im in kust("overlays/staging-cassandra")["images"]:
+    if im["name"] not in renamed:
+        problems.append(f"overlays/staging-cassandra retags {im['name']}, which staging does not produce")
+
+patch = yaml.safe_load(kust("overlays/staging-cassandra")["patches"][0]["patch"])
+node = order
+if not isinstance(order.get("env"), list):
+    problems.append("order-service container has no env list for the JSON patch to append to")
+for op in patch:
+    if not op["path"].endswith("/env/-") or "/containers/0/" not in op["path"]:
+        problems.append(f"unexpected patch path {op['path']}")
+
+# the tag in staging must equal VERSION
+version = (ROOT/"../../VERSION").read_text().strip()
+for im in kust("overlays/staging")["images"]:
+    if im["newTag"] != version:
+        problems.append(f"overlays/staging tag {im['newTag']} != VERSION {version}")
+for im in kust("overlays/staging-cassandra")["images"]:
+    if im["newTag"] != version + "-cassandra":
+        problems.append(f"overlays/staging-cassandra tag {im['newTag']} != {version}-cassandra")
+for (kd, nm), d in by_kind.items():
+    if kd == "Deployment":
+        tag = d["spec"]["template"]["spec"]["containers"][0]["image"].rsplit(":", 1)[1]
+        if tag != version:
+            problems.append(f"base {nm} image tag {tag} != VERSION {version}")
+
+print("PROBLEMS:" if problems else "structure checks: all passed")
+for p in problems: print("  -", p)
+sys.exit(1 if problems else 0)

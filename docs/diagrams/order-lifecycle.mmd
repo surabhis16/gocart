@@ -1,0 +1,19 @@
+stateDiagram-v2
+    direction LR
+    [*] --> placed: OrderPlaced
+    placed --> confirmed: OrderConfirmed
+    placed --> rejected: OrderRejected
+    confirmed --> shipped: OrderShipped
+    confirmed --> cancelled: OrderCancelled
+    cancelled --> cancelled: StockReleased
+    rejected --> [*]
+    shipped --> [*]
+    note right of placed
+        Product service has not
+        answered yet. Reconciled
+        automatically.
+    end note
+    note right of cancelled
+        Stock release is owed until
+        StockReleased is recorded.
+    end note

@@ -1,0 +1,45 @@
+# GoCart, locally:    docker compose up --build
+# Then try it:        ./scripts/smoke.sh        ./scripts/outage-demo.sh
+# Start from scratch: docker compose down -v
+#
+# With Cassandra as the Order service's event store (Unit IV):
+#   docker compose -f docker-compose.yml -f docker-compose.cassandra.yml up --build
+name: gocart
+
+x-version: &version ${VERSION:-0.1.0}
+
+services:
+  product-service:
+    image: gocart/product-service:${VERSION:-0.1.0}
+    build:
+      context: ./product-service
+      args:
+        VERSION: *version
+    ports:
+      - "8080:8080"
+    volumes:
+      - product-data:/data
+    restart: unless-stopped
+    # Each service owns its data: there is no database both can reach.
+
+  order-service:
+    image: gocart/order-service:${VERSION:-0.1.0}
+    build:
+      context: ./order-service
+      args:
+        VERSION: *version
+    environment:
+      PRODUCT_URL: http://product-service:8080
+      RECONCILE_INTERVAL: 5s
+    ports:
+      - "8081:8081"
+    volumes:
+      - order-data:/data
+    depends_on:
+      product-service:
+        condition: service_healthy # start-up order only; the Order service also copes with Product going away later
+    restart: unless-stopped
+
+volumes:
+  product-data:
+  order-data:

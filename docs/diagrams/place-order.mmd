@@ -1,0 +1,15 @@
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant O as Order service
+    participant L as Event log
+    participant P as Product service
+
+    C->>O: POST /orders  (Idempotency-Key)
+    Note over O: validate the request
+    O->>L: append OrderPlaced (v1)
+    O->>P: POST /reservations  (order id, items)
+    Note over P: all lines or none,<br/>idempotent per order id
+    P-->>O: 201 reserved, with names and prices
+    O->>L: append OrderConfirmed (v2)
+    O-->>C: 201 Created, status confirmed

@@ -1,0 +1,129 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Each service is built and tested on its own: they are separate modules and
+  # must stay independently buildable. The tests include one that fails if a
+  # service's routes drift from its OpenAPI file in docs/openapi/.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [product-service, order-service]
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false # no third-party dependencies, so there is nothing to cache
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  # The Cassandra event store is behind a build tag and needs a real Cassandra,
+  # so it gets its own job: compile it, then run the exact contract tests the
+  # file store passes against a live node.
+  cassandra-event-store:
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off" # the root go.work is for local convenience; `go get` should edit this module's own go.mod
+    services:
+      cassandra:
+        image: cassandra:5.0
+        ports:
+          - 9042:9042
+        env:
+          MAX_HEAP_SIZE: 512M
+          HEAP_NEWSIZE: 128M
+        options: >-
+          --health-cmd "cqlsh -e 'describe keyspaces'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    defaults:
+      run:
+        working-directory: order-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Fetch the driver (same pin as the Dockerfile)
+        run: |
+          driver=$(sed -n 's/^ARG CASSANDRA_DRIVER=//p' Dockerfile)
+          go get "$driver"
+          go mod tidy
+      - run: go vet -tags cassandra ./...
+      - name: Event store contract against a real Cassandra
+        env:
+          CASSANDRA_TEST_HOSTS: 127.0.0.1
+        run: go test -tags cassandra -race -count=1 -v -run Cassandra ./internal/eventstore
+
+  # Infrastructure is code, so it is checked like code. `plan` runs with
+  # throw-away credentials (offline=true): no AWS account, no cost.
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: infra/terraform
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+        working-directory: infra/terraform
+      - name: terraform validate
+        run: terraform validate
+        working-directory: infra/terraform
+      - name: terraform plan
+        run: terraform plan -input=false -lock=false -var offline=true
+        working-directory: infra/terraform
+      - name: Kubernetes manifests
+        run: |
+          pip install pyyaml kubernetes-validate
+          python3 scripts/check-k8s.py
+      - name: Compose files
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.cassandra.yml config --quiet
+
+  # The real thing: build both images, start them, and drive them over HTTP,
+  # including taking the Product service away mid-flow.
+  end-to-end:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the stack
+        run: docker compose up -d --build --wait --wait-timeout 120
+      - name: Smoke test
+        run: ./scripts/smoke.sh
+      - name: Outage and recovery
+        run: |
+          docker compose down -v
+          docker compose up -d --wait --wait-timeout 120
+          ./scripts/outage-demo.sh
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

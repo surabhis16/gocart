@@ -1,0 +1,15 @@
+# local run data
+data/
+# built binaries
+/product-service/product-service
+/order-service/order-service
+*.exe
+# editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

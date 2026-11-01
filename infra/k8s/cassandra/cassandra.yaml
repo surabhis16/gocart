@@ -1,0 +1,64 @@
+# A single-node Cassandra for the Order service's event store. One node is for
+# learning and for a laptop; it is not a replicated cluster. Needs about 1.5 GiB.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra
+  labels:
+    app.kubernetes.io/name: cassandra
+spec:
+  clusterIP: None # headless: gives the StatefulSet's pod a stable DNS name
+  selector:
+    app.kubernetes.io/name: cassandra
+  ports:
+    - { name: cql, port: 9042 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cassandra
+  labels:
+    app.kubernetes.io/name: cassandra
+    app.kubernetes.io/component: event-store
+spec:
+  serviceName: cassandra
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cassandra
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cassandra
+        app.kubernetes.io/component: event-store
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cassandra
+          image: cassandra:5.0
+          ports:
+            - { name: cql, containerPort: 9042 }
+          env:
+            - { name: CASSANDRA_CLUSTER_NAME, value: gocart }
+            - { name: MAX_HEAP_SIZE, value: 512M } # both must be set together
+            - { name: HEAP_NEWSIZE, value: 128M }
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1"]
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 20
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { memory: 1536Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/cassandra }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi

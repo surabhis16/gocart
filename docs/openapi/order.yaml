@@ -1,0 +1,441 @@
+openapi: 3.0.3
+info:
+  title: GoCart Order Service
+  version: 0.1.0
+  description: |
+    The Order bounded context: placing, cancelling and shipping orders.
+
+    **Event sourced.** An order is stored as the list of facts that happened to
+    it. `GET /orders/{id}/events` shows that list; every other read is served
+    from a read model built from it (CQRS).
+
+    **Placing an order talks to the Product service**, which reserves stock. The
+    two services cannot share a transaction, so there are three honest outcomes
+    rather than two:
+
+    | Outcome | Status | Meaning |
+    |---|---|---|
+    | confirmed | `201` | Stock reserved, prices fixed. |
+    | rejected | `409` | The Product service said no (`order-rejected`). The order is still recorded and visible. |
+    | placed | `202` | The Product service did not answer. The order is safe and is completed automatically; poll `Location`. |
+
+    **Retries.** Send an `Idempotency-Key` header with `POST /orders`. Repeating
+    the same key with the same request returns the same order (`200`) instead
+    of creating a second one. Reusing a key with a different request is a `422`.
+
+    **Money** is an integer in the smallest currency unit (paise), never a float.
+
+    **Errors** are RFC 9457 problem documents (`application/problem+json`) whose
+    `type` is a URN, listed under `Problem`.
+servers:
+  - url: http://localhost:8081
+    description: Local (docker compose or `go run`)
+tags:
+  - name: orders
+    description: Place and look up orders.
+  - name: lifecycle
+    description: Move an order through its life cycle.
+  - name: ops
+    description: Operational endpoints.
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /orders:
+    post:
+      tags: [orders]
+      operationId: placeOrder
+      summary: Place an order
+      description: |
+        Records the order, then asks the Product service to reserve stock for
+        every line, all or none. See the outcomes table at the top of this
+        document.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceOrderRequest"
+      responses:
+        "201":
+          description: Confirmed. Stock is reserved and the order is priced.
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /orders/ord_9f2c41d0a7b35e68
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "200":
+          description: An earlier request with this `Idempotency-Key` was found; its order is returned unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "202":
+          description: |
+            Accepted but not yet decided, because the Product service could not
+            be reached. The order is durable and will be settled automatically.
+          headers:
+            Location:
+              schema:
+                type: string
+            Retry-After:
+              schema:
+                type: integer
+                example: 5
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "409":
+          description: |
+            `order-rejected`: the Product service refused (not enough stock,
+            unknown product). `order_id` and `reason` say which order and why;
+            the order stays visible at `GET /orders/{id}`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: |
+            The request is invalid (`validation-failed`), or the
+            `Idempotency-Key` was already used for a different request
+            (`idempotency-key-reuse`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    get:
+      tags: [orders]
+      operationId: listOrders
+      summary: List orders (read model)
+      description: Newest first. Served from the projection; nothing is replayed.
+      parameters:
+        - name: customer_id
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/Status"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Matching orders.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Order"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /orders/{id}:
+    get:
+      tags: [orders]
+      operationId: getOrder
+      summary: Get one order (read model)
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /orders/{id}/events:
+    get:
+      tags: [orders]
+      operationId: getOrderEvents
+      summary: Get an order's event history (the event store)
+      description: |
+        The facts the order's state was derived from, oldest first. This reads
+        the event store directly, not the read model.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order's events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order_id, events]
+                properties:
+                  order_id:
+                    type: string
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Event"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /orders/{id}/cancel:
+    post:
+      tags: [lifecycle]
+      operationId: cancelOrder
+      summary: Cancel a confirmed order
+      description: |
+        Records the cancellation and returns the reserved stock to the Product
+        service. If the Product service cannot be reached, the cancellation
+        still succeeds and `stock_release_pending` is `true` until the release
+        has been completed automatically.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  maxLength: 200
+      responses:
+        "200":
+          description: The cancelled order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidState"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /orders/{id}/ship:
+    post:
+      tags: [lifecycle]
+      operationId: shipOrder
+      summary: Mark a confirmed order as shipped
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The shipped order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidState"
+components:
+  parameters:
+    OrderId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        example: ord_9f2c41d0a7b35e68
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes retries safe. Scoped to the customer: two customers using the same
+        key do not collide.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._:-]{1,128}$"
+        example: checkout-7c1e2f
+  responses:
+    MalformedBody:
+      description: The body is not valid JSON, has unknown fields, or has trailing data.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationFailed:
+      description: The request was understood but breaks a rule. `detail` says which.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: No such order.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    InvalidState:
+      description: The order's current status does not allow this action (`invalid-state`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Status:
+      type: string
+      enum: [placed, confirmed, rejected, cancelled, shipped]
+      description: |
+        `placed` waiting for the Product service; `confirmed` stock reserved;
+        `rejected` refused by the Product service; `cancelled`; `shipped`.
+    Item:
+      type: object
+      required: [product_id, quantity]
+      additionalProperties: false
+      properties:
+        product_id:
+          type: string
+          example: prd_keyboard
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 2
+    PlaceOrderRequest:
+      type: object
+      required: [customer_id, items]
+      additionalProperties: false
+      properties:
+        customer_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          example: cust_asha
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: One entry per product; combine quantities rather than repeating a product.
+          items:
+            $ref: "#/components/schemas/Item"
+    OrderItem:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: string
+        name:
+          type: string
+          description: Present once stock has been reserved.
+        quantity:
+          type: integer
+        unit_price_minor:
+          type: integer
+          format: int64
+          description: Price quoted when stock was reserved. Present once reserved.
+    Order:
+      type: object
+      required: [id, customer_id, status, items, placed_at, updated_at, version]
+      properties:
+        id:
+          type: string
+        customer_id:
+          type: string
+        status:
+          $ref: "#/components/schemas/Status"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        total_minor:
+          type: integer
+          format: int64
+          description: Present once confirmed.
+        currency:
+          type: string
+          example: INR
+        reject_reason:
+          type: string
+          description: "One of `insufficient_stock`, `unknown_product`, `invalid_items`, `refused`."
+        reject_detail:
+          type: string
+        stock_release_pending:
+          type: boolean
+          description: Present and `true` while a cancelled order's stock has not yet been returned.
+        placed_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          description: Number of events recorded for this order.
+    Event:
+      type: object
+      required: [version, type, at, data]
+      properties:
+        version:
+          type: integer
+          description: Position in this order's stream, starting at 1.
+        type:
+          type: string
+          enum: [OrderPlaced, OrderConfirmed, OrderRejected, OrderCancelled, StockReleased, OrderShipped]
+        at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          description: Event-specific payload.
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem details. `type` is `urn:gocart:problem:` followed by one
+        of `invalid-request`, `validation-failed`, `not-found`, `order-rejected`,
+        `invalid-state`, `idempotency-key-reuse`, `concurrent-modification`,
+        `payload-too-large` or `internal`.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          example: urn:gocart:problem:order-rejected
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        request_id:
+          type: string
+          description: Quote this when reporting a problem; it appears in both services' logs.
+        order_id:
+          type: string
+          description: Present on `order-rejected`.
+        reason:
+          type: string
+          description: Present on `order-rejected`.
