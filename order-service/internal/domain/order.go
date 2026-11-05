@@ -8,16 +8,24 @@
 //
 // Life cycle:
 //
-//	placed ──► confirmed ──► shipped
-//	   │           │
-//	   │           └──► cancelled   (stock release is owed until StockReleased)
+//	placed ──► awaiting_payment ──► confirmed ──► shipped
+//	   │              │    │             │
+//	   │              │    │             └──► cancelled
+//	   │              │    └──► expired
+//	   │              └──► payment_failed
 //	   └──► rejected
+//
+// Three of those end states leave something owed to another service, and the
+// order says so until it has been paid back: cancelled, payment_failed and
+// expired all owe a stock release; cancelled and expired also owe the payment
+// service a void or refund. Those debts are the saga's compensations.
 package domain
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -59,21 +67,40 @@ func badTransition(format string, args ...any) error {
 type Status string
 
 const (
-	StatusPlaced    Status = "placed"    // accepted; waiting for the Product service to reserve stock
-	StatusConfirmed Status = "confirmed" // stock is reserved and priced
-	StatusRejected  Status = "rejected"  // the Product service refused (no stock, unknown product)
-	StatusCancelled Status = "cancelled"
-	StatusShipped   Status = "shipped"
+	StatusPlaced          Status = "placed"           // accepted; waiting for the Product service to reserve stock
+	StatusAwaitingPayment Status = "awaiting_payment" // stock is held and priced; waiting for the Payment service
+	StatusConfirmed       Status = "confirmed"        // stock held and paid for
+	StatusRejected        Status = "rejected"         // the Product service refused (no stock, unknown product)
+	StatusPaymentFailed   Status = "payment_failed"   // the card was declined; the stock goes back
+	StatusExpired         Status = "expired"          // nobody paid in time; the stock goes back
+	StatusCancelled       Status = "cancelled"
+	StatusShipped         Status = "shipped"
 )
+
+// AllStatuses lists every status, for validating filters.
+var AllStatuses = []Status{
+	StatusPlaced, StatusAwaitingPayment, StatusConfirmed, StatusRejected,
+	StatusPaymentFailed, StatusExpired, StatusCancelled, StatusShipped,
+}
 
 // Event types. Names are past tense: they record facts, not intentions.
 const (
-	TypeOrderPlaced    = "OrderPlaced"
+	TypeOrderPlaced        = "OrderPlaced"
+	TypeStockReserved      = "StockReserved"
+	TypeOrderRejected      = "OrderRejected"
+	TypePaymentCaptured    = "PaymentCaptured"
+	TypePaymentDeclined    = "PaymentDeclined"
+	TypeReservationExpired = "ReservationExpired"
+	TypeOrderCancelled     = "OrderCancelled"
+	TypeStockReleased      = "StockReleased"
+	TypePaymentRefunded    = "PaymentRefunded"
+	TypeOrderShipped       = "OrderShipped"
+
+	// TypeOrderConfirmed is the version 0.1 way of confirming an order, written
+	// when there was no payment step: stock reserved, done. New code never
+	// writes it, but logs written by 0.1 contain it, and a stored event is a
+	// fact that cannot be rewritten, so replay must keep understanding it.
 	TypeOrderConfirmed = "OrderConfirmed"
-	TypeOrderRejected  = "OrderRejected"
-	TypeOrderCancelled = "OrderCancelled"
-	TypeStockReleased  = "StockReleased"
-	TypeOrderShipped   = "OrderShipped"
 )
 
 // Event is the envelope every fact is stored in. Version is the event's
@@ -107,8 +134,18 @@ type (
 	OrderPlaced struct {
 		CustomerID string `json:"customer_id"`
 		Items      []Item `json:"items"`
+		// PaymentToken is an opaque reference to a payment method held by the
+		// provider, never a card number. It is kept so a payment that could not
+		// be completed can be retried without asking the customer again. It is
+		// absent from events written before payments existed.
+		PaymentToken string `json:"payment_token,omitempty"`
 	}
-	OrderConfirmed struct {
+	StockReserved struct {
+		Items      []PricedItem `json:"items"`
+		TotalMinor int64        `json:"total_minor"`
+		Currency   string       `json:"currency"`
+	}
+	OrderConfirmed struct { // legacy, see TypeOrderConfirmed
 		Items      []PricedItem `json:"items"`
 		TotalMinor int64        `json:"total_minor"`
 		Currency   string       `json:"currency"`
@@ -117,11 +154,19 @@ type (
 		Reason  string `json:"reason"`
 		Message string `json:"message,omitempty"`
 	}
-	OrderCancelled struct {
+	PaymentCaptured struct {
+		Reference string `json:"reference"`
+	}
+	PaymentDeclined struct {
+		Code string `json:"code"`
+	}
+	ReservationExpired struct{}
+	OrderCancelled     struct {
 		Reason string `json:"reason,omitempty"`
 	}
-	StockReleased struct{}
-	OrderShipped  struct{}
+	StockReleased   struct{}
+	PaymentRefunded struct{}
+	OrderShipped    struct{}
 )
 
 // Order is the aggregate: the state obtained by replaying an order's events.
@@ -131,16 +176,27 @@ type Order struct {
 	CustomerID string
 	Status     Status
 
-	Items        []PricedItem // requested items until confirmed, then priced
+	Items        []PricedItem // requested items until stock is reserved, then priced
 	TotalMinor   int64
 	Currency     string
 	RejectReason string
 	RejectDetail string
 
-	// ReleasePending is true from OrderCancelled until StockReleased: the order
-	// is cancelled but the Product service has not yet been told to put the
-	// stock back. Something must still do that.
+	PaymentToken     string // see OrderPlaced; never exposed by the API
+	PaymentReference string // the provider's id, once captured
+	DeclineCode      string
+	// NoPaymentStep is true for an order confirmed by a version 0.1 event: it
+	// was never charged, so cancelling it has nothing to refund.
+	NoPaymentStep bool
+
+	// ReleasePending is true from the moment an order ends without its stock
+	// being used (cancelled, payment_failed, expired) until StockReleased: the
+	// Product service has not yet been told to put the stock back, and
+	// something must still do that.
 	ReleasePending bool
+	// RefundPending is the same for money: the Payment service has not yet
+	// been told to void or refund this order's charge.
+	RefundPending bool
 
 	PlacedAt  time.Time
 	UpdatedAt time.Time
@@ -184,12 +240,23 @@ func (o *Order) Apply(e Event) error {
 			return fmt.Errorf("stream %s v%d: %w", e.StreamID, e.Version, err)
 		}
 		o.ID, o.CustomerID, o.Status, o.PlacedAt = e.StreamID, d.CustomerID, StatusPlaced, e.At
+		o.PaymentToken = d.PaymentToken
 		o.Items = make([]PricedItem, len(d.Items))
 		for i, it := range d.Items {
 			o.Items[i] = PricedItem{ProductID: it.ProductID, Quantity: it.Quantity}
 		}
 
-	case TypeOrderConfirmed:
+	case TypeStockReserved:
+		if err := need(StatusPlaced); err != nil {
+			return err
+		}
+		var d StockReserved
+		if err := json.Unmarshal(e.Data, &d); err != nil {
+			return fmt.Errorf("stream %s v%d: %w", e.StreamID, e.Version, err)
+		}
+		o.Status, o.Items, o.TotalMinor, o.Currency = StatusAwaitingPayment, d.Items, d.TotalMinor, d.Currency
+
+	case TypeOrderConfirmed: // legacy: stock reserved and the order done, no payment step
 		if err := need(StatusPlaced); err != nil {
 			return err
 		}
@@ -198,6 +265,34 @@ func (o *Order) Apply(e Event) error {
 			return fmt.Errorf("stream %s v%d: %w", e.StreamID, e.Version, err)
 		}
 		o.Status, o.Items, o.TotalMinor, o.Currency = StatusConfirmed, d.Items, d.TotalMinor, d.Currency
+		o.NoPaymentStep = true
+
+	case TypePaymentCaptured:
+		if err := need(StatusAwaitingPayment); err != nil {
+			return err
+		}
+		var d PaymentCaptured
+		if err := json.Unmarshal(e.Data, &d); err != nil {
+			return fmt.Errorf("stream %s v%d: %w", e.StreamID, e.Version, err)
+		}
+		o.Status, o.PaymentReference = StatusConfirmed, d.Reference
+
+	case TypePaymentDeclined:
+		if err := need(StatusAwaitingPayment); err != nil {
+			return err
+		}
+		var d PaymentDeclined
+		if err := json.Unmarshal(e.Data, &d); err != nil {
+			return fmt.Errorf("stream %s v%d: %w", e.StreamID, e.Version, err)
+		}
+		o.Status, o.DeclineCode, o.ReleasePending = StatusPaymentFailed, d.Code, true
+
+	case TypeReservationExpired:
+		if err := need(StatusAwaitingPayment); err != nil {
+			return err
+		}
+		// The charge may be in flight right now, so a void is owed too.
+		o.Status, o.ReleasePending, o.RefundPending = StatusExpired, true, true
 
 	case TypeOrderRejected:
 		if err := need(StatusPlaced); err != nil {
@@ -214,15 +309,19 @@ func (o *Order) Apply(e Event) error {
 			return err
 		}
 		o.Status, o.ReleasePending = StatusCancelled, true
+		o.RefundPending = !o.NoPaymentStep
 
 	case TypeStockReleased:
-		if err := need(StatusCancelled); err != nil {
-			return err
-		}
 		if !o.ReleasePending {
 			return fmt.Errorf("stream %s v%d: StockReleased but no release was owed", e.StreamID, e.Version)
 		}
 		o.ReleasePending = false
+
+	case TypePaymentRefunded:
+		if !o.RefundPending {
+			return fmt.Errorf("stream %s v%d: PaymentRefunded but no refund was owed", e.StreamID, e.Version)
+		}
+		o.RefundPending = false
 
 	case TypeOrderShipped:
 		if err := need(StatusConfirmed); err != nil {
@@ -241,8 +340,13 @@ func (o *Order) Apply(e Event) error {
 	return nil
 }
 
+// tokenPattern is the shape of a provider payment token. The Payment service
+// enforces the same rule; it is repeated here on purpose, so that a card number
+// is refused before this service writes it into an append-only log.
+var tokenPattern = regexp.MustCompile(`^tok_[a-z0-9_]{1,40}$`)
+
 // Place validates a new order and returns its first event.
-func Place(id, customerID string, items []Item, now time.Time) (Event, error) {
+func Place(id, customerID string, items []Item, paymentToken string, now time.Time) (Event, error) {
 	customerID = strings.TrimSpace(customerID)
 	if customerID == "" || len(customerID) > MaxIDLen || hasControl(customerID) {
 		return Event{}, invalid("customer_id must be 1-%d printable characters", MaxIDLen)
@@ -262,19 +366,51 @@ func Place(id, customerID string, items []Item, now time.Time) (Event, error) {
 		}
 		seen[it.ProductID] = true
 	}
-	return newEvent(id, 1, TypeOrderPlaced, OrderPlaced{CustomerID: customerID, Items: items}, now), nil
+	if !tokenPattern.MatchString(paymentToken) {
+		// An immutable log is a terrible place for a card number, so anything
+		// that is not clearly a provider token is refused before it is stored.
+		return Event{}, invalid("payment_token must be a provider token such as tok_visa, never a card number")
+	}
+	return newEvent(id, 1, TypeOrderPlaced, OrderPlaced{CustomerID: customerID, Items: items, PaymentToken: paymentToken}, now), nil
 }
 
-// Confirm records that stock was reserved at the quoted prices.
-func (o Order) Confirm(priced []PricedItem, currency string, now time.Time) (Event, error) {
+// ReserveStock records that the Product service holds stock for the order, at
+// the prices it quoted, and works out the total to charge.
+func (o Order) ReserveStock(priced []PricedItem, currency string, now time.Time) (Event, error) {
 	if o.Status != StatusPlaced {
-		return Event{}, badTransition("order %s is %s; only a placed order can be confirmed", o.ID, o.Status)
+		return Event{}, badTransition("order %s is %s; stock can only be reserved for a placed order", o.ID, o.Status)
 	}
 	var total int64
 	for _, it := range priced {
 		total += int64(it.Quantity) * it.UnitPriceMinor
 	}
-	return o.next(TypeOrderConfirmed, OrderConfirmed{Items: priced, TotalMinor: total, Currency: currency}, now), nil
+	return o.next(TypeStockReserved, StockReserved{Items: priced, TotalMinor: total, Currency: currency}, now), nil
+}
+
+// CapturePayment records that the Payment service took the money.
+func (o Order) CapturePayment(reference string, now time.Time) (Event, error) {
+	if o.Status != StatusAwaitingPayment {
+		return Event{}, badTransition("order %s is %s; only an order awaiting payment can be paid", o.ID, o.Status)
+	}
+	return o.next(TypePaymentCaptured, PaymentCaptured{Reference: reference}, now), nil
+}
+
+// DeclinePayment records a definite refusal by the card network. The stock is
+// now owed back.
+func (o Order) DeclinePayment(code string, now time.Time) (Event, error) {
+	if o.Status != StatusAwaitingPayment {
+		return Event{}, badTransition("order %s is %s; only an order awaiting payment can be declined", o.ID, o.Status)
+	}
+	return o.next(TypePaymentDeclined, PaymentDeclined{Code: code}, now), nil
+}
+
+// Expire gives up on an order nobody paid for. The stock is owed back, and so
+// is a void of the charge, in case one is on its way.
+func (o Order) Expire(now time.Time) (Event, error) {
+	if o.Status != StatusAwaitingPayment {
+		return Event{}, badTransition("order %s is %s; only an order awaiting payment can expire", o.ID, o.Status)
+	}
+	return o.next(TypeReservationExpired, ReservationExpired{}, now), nil
 }
 
 // Reject records that the Product service refused the order.
@@ -295,6 +431,14 @@ func (o Order) Cancel(reason string, now time.Time) (Event, error) {
 		return Event{}, badTransition("order %s is %s; only a confirmed order can be cancelled", o.ID, o.Status)
 	}
 	return o.next(TypeOrderCancelled, OrderCancelled{Reason: reason}, now), nil
+}
+
+// MarkPaymentRefunded records that the Payment service has voided the charge.
+func (o Order) MarkPaymentRefunded(now time.Time) (Event, error) {
+	if !o.RefundPending {
+		return Event{}, badTransition("order %s is not waiting for a refund", o.ID)
+	}
+	return o.next(TypePaymentRefunded, PaymentRefunded{}, now), nil
 }
 
 // MarkStockReleased records that the Product service has put the stock back.

@@ -4,12 +4,21 @@ namespace: gocart-staging
 resources:
   - namespace.yaml
   - ../../base
+secretGenerator:
+  - name: gocart-admin
+    literals:
+      - admin-key=dev-admin-key # DEMO VALUE. See docs/operations.md before using this anywhere real.
+    options:
+      disableNameSuffixHash: true
 # The tags below are bumped together with the VERSION file by
 # scripts/bump-version.sh; scripts/ship.sh refuses to run if they disagree.
 images:
   - name: gocart/product-service
     newName: localhost:5000/gocart/product-service
-    newTag: 0.1.0
+    newTag: 0.2.0
   - name: gocart/order-service
     newName: localhost:5000/gocart/order-service
-    newTag: 0.1.0
+    newTag: 0.2.0
+  - name: gocart/payment-service
+    newName: localhost:5000/gocart/payment-service
+    newTag: 0.2.0

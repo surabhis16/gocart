@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: GoCart Product Service
-  version: 0.1.0
+  version: 0.2.0
   description: |
     The Product bounded context: the catalogue, and the stock that other
     services reserve against it.
@@ -44,6 +44,23 @@ paths:
                   status:
                     type: string
                     example: ok
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Request counts and latency by route pattern, plus this service's own
+        gauges. Plain text in the Prometheus exposition format. Not
+        authenticated: it holds counts only, and is meant to be reachable by the
+        scraper, not by the internet.
+      responses:
+        "200":
+          description: Metrics in the Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
   /products:
     get:
       tags: [catalogue]
@@ -66,6 +83,8 @@ paths:
     post:
       tags: [catalogue]
       operationId: createProduct
+      security:
+        - adminKey: []
       summary: Add a product (admin)
       requestBody:
         required: true
@@ -74,6 +93,10 @@ paths:
             schema:
               $ref: "#/components/schemas/NewProduct"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Unauthorized"
         "201":
           description: Created. The new product's URL is in `Location`.
           headers:
@@ -109,6 +132,8 @@ paths:
     put:
       tags: [catalogue]
       operationId: setStock
+      security:
+        - adminKey: []
       summary: Set a product's stock level (admin restock)
       description: Sets the absolute level. It does not touch stock already reserved.
       parameters:
@@ -128,6 +153,10 @@ paths:
                   maximum: 1000000
                   example: 50
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Unauthorized"
         "200":
           description: The updated product.
           content:
@@ -240,6 +269,23 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: |
+        `unauthorized`: the admin key is missing or wrong. Or `admin-disabled`
+        (403): the service was started without an admin key, so admin operations
+        are refused.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  securitySchemes:
+    adminKey:
+      type: http
+      scheme: bearer
+      description: |
+        The shop's own shared secret (`ADMIN_KEY`), sent as
+        `Authorization: Bearer <key>`. It says "this is the shop's tooling", not
+        "this is customer X"; there are no customer logins yet.
   schemas:
     Product:
       type: object
@@ -351,7 +397,7 @@ components:
         RFC 9457 problem details. `type` is one of `urn:gocart:problem:` followed
         by `invalid-request`, `validation-failed`, `not-found`,
         `insufficient-stock`, `unknown-product`, `reservation-mismatch`,
-        `payload-too-large` or `internal`. Extension members depend on the type.
+        `payload-too-large`, `unauthorized`, `admin-disabled` or `internal`. Extension members depend on the type.
       required: [type, title, status]
       properties:
         type:

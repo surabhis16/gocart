@@ -1,13 +1,13 @@
 # Everyday commands. `make help` lists them.
 .DEFAULT_GOAL := help
-SERVICES := product-service order-service
+SERVICES := product-service order-service payment-service
 
 .PHONY: help
 help: ## Show this help
 	@awk 'BEGIN{FS=":.*## "} /^[a-z0-9-]+:.*## /{printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: test
-test: ## Format check, vet and race-detector tests for both services
+test: ## Format check, vet and race-detector tests for every service
 	@for s in $(SERVICES); do \
 	  echo "== $$s"; \
 	  (cd $$s && test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }) && \
@@ -15,7 +15,7 @@ test: ## Format check, vet and race-detector tests for both services
 	done
 
 .PHONY: up
-up: ## Build and start both services with Docker Compose
+up: ## Build and start all three services with Docker Compose
 	docker compose up -d --build --wait
 
 .PHONY: up-cassandra
@@ -31,8 +31,12 @@ smoke: ## End-to-end checks against a fresh running stack
 	./scripts/smoke.sh
 
 .PHONY: outage
-outage: ## Demo: stop the Product service mid-order and watch recovery
+outage: ## Demo: stop Product, then Payment, mid-order and watch recovery
 	./scripts/outage-demo.sh
+
+.PHONY: oversell
+oversell: ## Demo: 20 customers x 2 clicks for 3 lamps; nothing oversold
+	./scripts/oversell-demo.sh
 
 .PHONY: k8s-check
 k8s-check: ## Validate the Kubernetes manifests (no cluster needed)

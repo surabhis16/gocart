@@ -1,0 +1,309 @@
+openapi: 3.0.3
+info:
+  title: GoCart Payment Service
+  version: 0.2.0
+  description: |
+    The Payment bounded context: taking, and giving back, payment for an order.
+
+    **There is no real money here.** Charges go to a mock provider that behaves
+    the way real ones do, chosen by the `payment_token` (see below), so the rest
+    of the system can be shown coping with declines and outages.
+
+    **A charge is identified by its order.** `POST /charges` for an order that
+    already has a charge returns the recorded answer; it never charges twice.
+    That is what makes it safe for the Order service to retry.
+
+    **Three answers, three actions.**
+
+    | Answer | Status | The caller should |
+    |---|---|---|
+    | approved | `201` (or `200` if repeated) | carry on |
+    | declined | `402` | stop: the answer is definite, retrying will not change it |
+    | provider did not answer | `503` | retry later: the outcome is unknown and nothing was recorded |
+
+    **Test tokens.**
+
+    | Token | Behaviour |
+    |---|---|
+    | `tok_visa`, or any other `tok_...` | approved |
+    | `tok_declined` | declined, `card_declined` |
+    | `tok_insufficient_funds` | declined, `insufficient_funds` |
+    | `tok_expired_card` | declined, `expired_card` |
+    | `tok_flaky` | provider unavailable on the first attempt for an order, then approved |
+    | `tok_down` | provider unavailable, always |
+    | `tok_slow` | approved, after a delay (default 5 s) |
+
+    The token must look like `tok_` plus lowercase letters, digits and
+    underscores. A card number is refused outright, so one pasted into the wrong
+    field is never stored.
+
+    **Money** is an integer in the smallest currency unit (paise).
+
+    **Errors** are RFC 9457 problem documents (`application/problem+json`) whose
+    `type` is a URN, listed under `Problem`.
+servers:
+  - url: http://localhost:8082
+    description: Local (docker compose or `go run`)
+tags:
+  - name: charges
+    description: Take, look up and cancel an order's payment.
+  - name: ops
+    description: Operational endpoints.
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Request counts and latency by route pattern, plus this service's own
+        gauges. Plain text in the Prometheus exposition format. Not
+        authenticated: it holds counts only, and is meant to be reachable by the
+        scraper, not by the internet.
+      responses:
+        "200":
+          description: Metrics in the Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /charges:
+    post:
+      tags: [charges]
+      operationId: createCharge
+      summary: Charge an order
+      description: |
+        Asks the provider to approve a charge for the order, or returns the
+        answer already recorded for it. A declined answer is returned as `402`
+        every time it is asked for; a different card needs a different order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChargeRequest"
+      responses:
+        "201":
+          description: Approved just now.
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /charges/ord_9f2c41d0a7b35e68
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Charge"
+        "200":
+          description: Approved earlier; the recorded charge is returned and the provider was not asked again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Charge"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "402":
+          description: |
+            `payment-declined`. Definite. `decline_code` is one of `card_declined`,
+            `insufficient_funds`, `expired_card`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            `charge-voided`: the order's charge was cancelled and cannot be taken
+            any more; or `charge-mismatch`: the order already has a charge for a
+            different amount or currency.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "503":
+          description: |
+            `provider-unavailable`. The provider did not answer, so nothing is
+            known and nothing was recorded. Safe to retry.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 2
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /charges/{order_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    get:
+      tags: [charges]
+      operationId: getCharge
+      security:
+        - adminKey: []
+      summary: Get an order's charge
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: The charge, whatever its status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Charge"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [charges]
+      operationId: cancelCharge
+      summary: Cancel an order's charge
+      description: |
+        Idempotent. An approved charge becomes `voided` (a refund). If the order
+        has no charge yet, a *tombstone* is recorded so that a charge request
+        still on its way can never succeed afterwards. A declined charge is left
+        as it is, because there is nothing to give back.
+      responses:
+        "204":
+          description: The order's charge is voided, or there was nothing to void.
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+components:
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema:
+        type: string
+        example: ord_9f2c41d0a7b35e68
+  responses:
+    MalformedBody:
+      description: The body is not valid JSON, has unknown fields, or has trailing data.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationFailed:
+      description: The request was understood but breaks a rule. `detail` says which.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: No charge for this order.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: |
+        `unauthorized`: the admin key is missing or wrong. Or `admin-disabled`
+        (403): the service was started without an admin key, so admin operations
+        are refused.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  securitySchemes:
+    adminKey:
+      type: http
+      scheme: bearer
+      description: |
+        The shop's own shared secret (`ADMIN_KEY`), sent as
+        `Authorization: Bearer <key>`. It says "this is the shop's tooling", not
+        "this is customer X"; there are no customer logins yet.
+  schemas:
+    ChargeRequest:
+      type: object
+      required: [order_id, amount_minor, currency, payment_token]
+      additionalProperties: false
+      properties:
+        order_id:
+          type: string
+          pattern: "^[A-Za-z0-9._:-]{1,64}$"
+          example: ord_9f2c41d0a7b35e68
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 10000000000
+          example: 259800
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          example: INR
+        payment_token:
+          type: string
+          pattern: "^tok_[a-z0-9_]{1,40}$"
+          example: tok_visa
+    Charge:
+      type: object
+      required: [order_id, status, amount_minor, currency, created_at]
+      properties:
+        order_id:
+          type: string
+        status:
+          type: string
+          enum: [approved, declined, voided]
+        amount_minor:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        reference:
+          type: string
+          description: The provider's id for the charge. Absent for a tombstone.
+          example: pay_3f9a1c07d2e84b56
+        decline_code:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        voided_at:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem details. `type` is `urn:gocart:problem:` followed by one
+        of `invalid-request`, `validation-failed`, `not-found`,
+        `payment-declined`, `provider-unavailable`, `charge-voided`,
+        `charge-mismatch`, `payload-too-large`, `unauthorized`, `admin-disabled` or `internal`.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          example: urn:gocart:problem:payment-declined
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        request_id:
+          type: string
+        order_id:
+          type: string
+        decline_code:
+          type: string
+          description: Present on `payment-declined`.

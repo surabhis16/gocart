@@ -1,0 +1,90 @@
+# Payment service. One replica, on purpose: its ledger is a single file with
+# exactly one writer, and a charge is serialised per order inside the process,
+# which is what makes "asking twice never charges twice" hold. Scaling it out
+# means moving the ledger to a database that can enforce that across replicas.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: payment-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/component: payments
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        app.kubernetes.io/component: payments
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: payment-service
+          image: gocart/payment-service:0.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8082
+          env:
+            - { name: PORT, value: "8082" }
+            - { name: DATA_DIR, value: /data }
+            - { name: LOG_LEVEL, value: info }
+            - { name: SLOW_DELAY, value: 5s }
+            - { name: ADMIN_KEY, valueFrom: { secretKeyRef: { name: gocart-admin, key: admin-key } } }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { memory: 192Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: payment-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+spec:
+  selector:
+    app.kubernetes.io/name: payment-service
+  ports:
+    - { name: http, port: 8082, targetPort: http }

@@ -1,0 +1,32 @@
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant O as Order service
+    participant L as Event log
+    participant P as Product service
+    participant Y as Payment service
+
+    Note over C,Y: A definite no: the card is declined
+    O->>Y: POST /charges
+    Y-->>O: 402 payment-declined
+    O->>L: append PaymentDeclined
+    O->>P: DELETE /reservations/{id}
+    O->>L: append StockReleased
+    O-->>C: 402, status payment_failed
+
+    Note over C,Y: No answer: nothing is known, so nothing is decided
+    O->>Y: POST /charges
+    Y--xO: no answer (provider down or slow)
+    O-->>C: 202 Accepted, status awaiting_payment
+    Note over O: the reconciler asks again, the Payment<br/>service returns its recorded answer
+    O->>Y: POST /charges  (same order id)
+    Y-->>O: 200 approved (the same charge)
+    O->>L: append PaymentCaptured
+
+    Note over C,Y: Nobody pays in time
+    Note over O: awaiting_payment older than the limit
+    O->>L: append ReservationExpired
+    O->>Y: DELETE /charges/{id}
+    Note over Y: void, or a tombstone so a charge<br/>still on its way can never succeed
+    O->>P: DELETE /reservations/{id}
+    O->>L: append StockReleased, PaymentRefunded

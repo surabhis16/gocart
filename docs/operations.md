@@ -19,31 +19,38 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 docker compose up --build
 ```
 
-Product is on <http://localhost:8080>, Order on <http://localhost:8081>. The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
+Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>. The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
 
 ```
 curl -s localhost:8080/products | python3 -m json.tool
 
 curl -s -X POST localhost:8081/orders \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
-  -d '{"customer_id":"cust_asha","items":[{"product_id":"prd_keyboard","quantity":2}]}'
+  -d '{"customer_id":"cust_asha","payment_token":"tok_visa","items":[{"product_id":"prd_keyboard","quantity":2}]}'
 ```
 
-Then look at what was actually stored, which is the event-sourcing demo:
+There is no real money. `payment_token` picks how the mock card network behaves: `tok_visa` (or any `tok_...`) is approved, `tok_declined`, `tok_insufficient_funds` and `tok_expired_card` are declined, `tok_flaky` fails once then works, `tok_down` never answers, `tok_slow` answers after a delay. The full table is in [`openapi/payment.yaml`](openapi/payment.yaml). Try a declined one and look at the status code (`402`), then at the lamp's stock (it went back).
+
+Then look at what was actually stored, which is the event-sourcing demo. The event log and the charge are admin-only, so they need the key (see [Admin key](#admin-key-and-metrics)):
 
 ```
-curl -s localhost:8081/orders/<id-from-above>/events | python3 -m json.tool
+curl -s -H 'Authorization: Bearer dev-admin-key' localhost:8081/orders/<id-from-above>/events | python3 -m json.tool
 ```
 
-Two scripts exercise it end to end (use a fresh stack: `docker compose down -v`):
+You will see `OrderPlaced`, `StockReserved`, `PaymentCaptured`. The payment token is deliberately not shown (see [architecture.md](architecture.md#payments)).
 
-- `./scripts/smoke.sh`: 26 checks across both services: confirmed, retried, rejected, cancelled, refused.
-- `./scripts/outage-demo.sh`: stops the Product service mid-flow, places an order, brings Product back, and watches the order complete itself.
+Three scripts exercise it end to end (use a fresh stack for `smoke.sh`: `docker compose down -v`):
+
+- `./scripts/smoke.sh`: 48 checks across all three services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, admin endpoints refused without the key, metrics present.
+- `./scripts/oversell-demo.sh`: 20 customers each click "buy" twice at the same instant, for 3 lamps. It checks that exactly 3 orders were confirmed, stock ended at 0, exactly 3 charges were taken and no double-click was charged twice. It sets the stock itself, so it can be re-run.
+- `./scripts/outage-demo.sh`: two acts. The Product service goes down mid-order, then the Payment service does; each time the order is accepted (`202`), and finishes by itself when the service returns, with stock reserved once and money taken once.
 
 ### Without Docker
 
 ```
+export ADMIN_KEY=dev-admin-key
 (cd product-service && go run .)                       # :8080
+(cd payment-service && go run .)                       # :8082
 (cd order-service   && go run .)                       # :8081
 ```
 
@@ -55,13 +62,13 @@ Data goes to `./data` in each directory. Configuration is by environment variabl
 make test
 ```
 
-Format check, `go vet` and the race detector for both services: 76 tests (97 counting subtests). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
+Format check, `go vet` and the race detector for all three services: 164 tests (211 counting subtests). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
 
 ## Developer workspace (Unit IV)
 
 **Coding standards** are enforced by the machine instead of by review comments: CI fails on anything `gofmt` would change, on `go vet` findings, and on any data race (`go test -race`). Each service is a standard Go layout: `main.go` for wiring, `internal/` for everything else, so nothing outside a service can import its internals.
 
-**A containerised environment locally** is `docker-compose.yml`. Each Dockerfile is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
+**A containerised environment locally** is `docker-compose.yml`. Each of the three Dockerfiles is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
 
 ### Cassandra
 
@@ -106,7 +113,8 @@ kubectl -n gocart-local get pods
 The manifests make a few choices on purpose; each is commented in the YAML:
 
 - **One replica each, with a `Recreate` rollout.** State is a file with one writer; see the [limits table](architecture.md#known-limits).
-- **The Order service's readiness probe does not check the Product service.** If it did, a Product outage would take Order out of rotation, and the whole design is that Order keeps accepting orders during one.
+- **The Order service's readiness probe checks neither the Product nor the Payment service.** If it did, an outage of either would take Order out of rotation, and the whole design is that Order keeps accepting orders during one.
+- **The admin key comes from a Secret**, never from a literal in a Deployment. The `local` and `staging` overlays generate it from a demo value; see [Admin key](#admin-key-and-metrics).
 - **Hardened pods:** non-root, read-only root filesystem, all capabilities dropped, default seccomp profile, resource limits.
 - **Cassandra** is a one-node StatefulSet with a headless Service and a volume claim template.
 
@@ -123,11 +131,11 @@ The manifests make a few choices on purpose; each is commented in the YAML:
 | The pipeline is the only path to a release | tag `v*` triggers `release.yml` |
 | Small, frequent, reversible changes | one `VERSION`, one-command bump (`scripts/bump-version.sh`), idempotent operations |
 | Environments are reproducible | `docker compose up`, `kubectl apply -k` |
-| Know when it is broken | structured JSON logs, a request ID across both services, health endpoints |
+| Know when it is broken | structured JSON logs, a request ID across all three services, a Prometheus `/metrics` endpoint on each, health endpoints |
 
 ### Terraform
 
-`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) per service, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
+`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) for each of the three services, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
 
 There is deliberately **no VPC, load balancer or cluster**. Those are the expensive parts of AWS, and this project runs on a laptop. The practice, which is what Unit III teaches, is infrastructure described in files, reviewed, planned, and applied by a pipeline.
 
@@ -146,7 +154,7 @@ terraform validate
 terraform plan -var offline=true
 ```
 
-By my count the plan should show 7 resources to add: 2 repositories, 2 lifecycle policies, 2 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). Check that against the real output before quoting it; I have not seen it.
+By my count the plan should show 10 resources to add: 3 repositories, 3 lifecycle policies, 3 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). Check that against the real output before quoting it; I have not seen it.
 
 > **What I did and did not verify.** `terraform` was not available in my environment, so I did not run `validate` or `plan`. I parsed all four files as HCL and checked by script that every `var.`, `local.`, resource and data reference resolves to something declared, and that nothing declared is unused. The CI job `infrastructure` runs `terraform fmt -check`, `init`, `validate` and `plan`; **that is the real verification, and I have not seen it pass.** Applying to real AWS needs an account and `-var offline=false`; I have not done that and I am not claiming the configuration applies cleanly. Free-tier LocalStack was not used, because I could not confirm that its free edition supports ECR.
 
@@ -159,7 +167,7 @@ By my count the plan should show 7 resources to add: 2 repositories, 2 lifecycle
 | `test` | per service: `gofmt`, `go vet`, `go test -race` (including the OpenAPI drift test) |
 | `cassandra-event-store` | compiles the Cassandra store and runs the shared contract suite against a live Cassandra |
 | `infrastructure` | `terraform fmt/validate/plan`, the Kubernetes check, both compose files |
-| `end-to-end` | builds both images, starts the stack, runs `smoke.sh`, then runs the outage demo |
+| `end-to-end` | builds the three images, starts the stack, runs `smoke.sh`, the oversell demo, then the outage demo |
 
 ## Releasing (Unit V)
 
@@ -174,13 +182,13 @@ This is the whole path from source to a running staging environment:
 1. confirms the manifests agree on the version in `VERSION`;
 2. enables minikube's `registry` addon, a registry running inside the cluster;
 3. opens it on `localhost:5000` on your machine;
-4. builds both images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
+4. builds the three images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
 5. applies the `staging` overlay into the `gocart-staging` namespace, which makes the cluster pull the *same name* from its own registry;
 6. waits for each rollout, then prints how to reach it.
 
-Then `./scripts/smoke.sh` against the forwarded ports, or the outage demo using `kubectl scale` as the way to take Product away (the exact commands are printed).
+Then `./scripts/smoke.sh` against the forwarded ports, or the outage demo using `kubectl scale` as the way to take Product and Payment away (the exact commands are printed).
 
-For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build both images and publish them to GitHub's free container registry, `ghcr.io`.
+For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build all three images and publish them to GitHub's free container registry, `ghcr.io`.
 
 `scripts/bump-version.sh 0.2.0` changes the version everywhere it is written (the `VERSION` file, the manifests, the compose defaults) and re-runs the consistency check. Left to hand edits, those drift apart and staging quietly runs a different image than the one you just shipped. I tested it by bumping up, bumping back, and confirming the tree is byte-identical to where it started.
 
@@ -217,17 +225,49 @@ Suppose the Product service must rename `price_minor`. GoCart has no `/v1` prefi
 
 At no step do two teams need to deploy together.
 
+### A real breaking change, and how it was handled
+
+Version 0.2 made `payment_token` a **required** field on `POST /orders`. That is a breaking change to a customer-facing contract: a client written against 0.1 now gets `422`. It was acceptable here for three reasons, and they are the questions to ask before any breaking change: the version is 0.x (no stability promise yet), an order without a payment method cannot complete, so there was no sensible default, and there is exactly one known client (the scripts, updated in the same change). With real clients the safe route is the one above: accept orders without a token for a while, answer them with an `awaiting_payment` order the client completes later, and only then require it.
+
 ### Change to stored data: events are forever
 
 The Order service's events are history and are never edited. The rules the code already enforces:
 
 - Adding an *optional* field to an event is safe: old events simply lack it.
 - Changing the *meaning* of an event is not. Add a new event type instead.
-- Reading an event type the code does not know **refuses to start** (`TestApplyRefusesDamagedHistory`). That is the right behaviour if an old binary meets a newer log: silently skipping an event would change what an order is. The cost is that you cannot roll the Order service back past a release that introduced a new event type without migrating the log. Know that before you ship one.
+- **A real case: `OrderConfirmed`.** Version 0.1 confirmed an order the moment stock was reserved and wrote `OrderConfirmed`. Version 0.2 splits that into `StockReserved` (stock held, amount worked out) and `PaymentCaptured` (money taken). The old events are facts in existing logs and cannot be rewritten, so 0.2 keeps *reading* `OrderConfirmed` (an order confirmed that way is marked as having had no payment step, so cancelling it releases stock but does not try to refund money that was never taken) and never *writes* it. `TestVersion01LogsStillReplay` and `TestVersion01OrdersSurviveTheUpgrade` hold this in place. The rule: a new version must read every event any earlier version wrote.
+- Reading an event type the code does not know **refuses to start** (`TestApplyRefusesDamagedHistory`). That is the right behaviour if an old binary meets a newer log: silently skipping an event would change what an order is. The cost is that you cannot roll the Order service back past a release that introduced a new event type without migrating the log. Know that before you ship one. Version 0.2 is exactly such a release: it can read a 0.1 log, but a 0.1 binary cannot read a log that 0.2 has added `StockReserved` to.
 
 ### Change under failure: retries must be safe
 
-Every operation that crosses a network is idempotent, which turns "the network lost the reply" from a data-corruption problem into a non-event: `Idempotency-Key` for customers, per-order-ID reservation and release between services. [architecture.md](architecture.md#orders-are-a-small-saga) has the detail.
+Every operation that crosses a network is idempotent, which turns "the network lost the reply" from a data-corruption problem into a non-event: `Idempotency-Key` for customers, per-order-ID reservation, release, charge and void between services. [architecture.md](architecture.md#orders-are-a-saga) has the detail.
+
+## Admin key and metrics
+
+### Admin key
+
+Some operations are not for customers: shipping an order, reading an order's raw event log, creating or restocking products, looking up a charge. Those require `Authorization: Bearer <ADMIN_KEY>`. Without the header, or with the wrong key, the answer is `401`. A service started with **no** `ADMIN_KEY` refuses every admin request rather than leaving them open, and says so in its log. The key is compared in constant time.
+
+This is a shared secret, which is the simplest thing that is honestly better than nothing. It is not per-user authentication, and it does not authenticate the Order service to the Payment service: the charge and void endpoints are open to anyone who can reach the Payment service's port. In a cluster, a NetworkPolicy would restrict that port to the Order service's pods; a service mesh would make it mutual TLS. Both are out of scope, and listed in the [known limits](architecture.md#known-limits).
+
+Compose and the Kubernetes overlays use the demo value `dev-admin-key`. **Do not use it anywhere real.** To use your own:
+
+```
+ADMIN_KEY=$(openssl rand -hex 24) docker compose up --build
+kubectl -n gocart-staging create secret generic gocart-admin --from-literal=admin-key="$(openssl rand -hex 24)" --dry-run=client -o yaml | kubectl apply -f -
+```
+
+and remove the `secretGenerator` from the overlay so it does not overwrite yours.
+
+### Metrics
+
+Each service serves Prometheus-format metrics at `/metrics`, written by hand (the format is small and stable, and it keeps the services dependency-free): request counts and latency histograms labelled by *route pattern* (`GET /orders/{id}`, never the raw path, so a million order ids are one series, not a million), plus numbers from each service's own domain: orders by status and the reconciler's backlog (Order), products, products out of stock and units in stock (Product), charges by status (Payment).
+
+```
+curl -s localhost:8081/metrics | grep gocart_
+```
+
+The two to watch are in the Order service: `gocart_orders_pending_work` with `kind` `placed` or `awaiting_payment` (something downstream is unavailable), and with `kind` `stock_release` or `refund` (a compensation is not landing). All four are the reconciler's backlog, and all should drain to zero.
 
 ## Measuring progress (Unit V)
 
@@ -238,15 +278,15 @@ The syllabus asks how to tell whether adopting microservices is working. The hon
 | **Deployment frequency** | How often you can safely ship | count of `v*` tags and `release.yml` runs |
 | **Lead time for changes** | Commit to running in staging | CI run time plus `ship.sh` duration |
 | **Change failure rate** | How often a release breaks something | red `end-to-end` runs on `main` / total |
-| **Time to restore** | How fast service comes back | measured: 10.2 s from `OrderPlaced` to `OrderConfirmed` in the outage demo (1 s reconcile interval) |
+| **Time to restore** | How fast service comes back | measured in the outage demo, from event timestamps: 10.8 s from `OrderPlaced` to `StockReserved` after Product returned, and 10.9 s from `StockReserved` to `PaymentCaptured` after Payment returned (1 s reconcile interval, 10 s grace) |
 
 And two that matter specifically for *this* architecture, because reducing coordination is its whole premise:
 
 - **Cross-team changes per release:** how many releases needed more than one team to change something. It should trend towards zero, and a service whose changes always drag another service along is the sign of a boundary in the wrong place.
 - **Splits and merges:** per the sizing formula, a healthy system keeps splitting where coordination hurts. Track *why* each boundary moved.
 
-A team that ships twice a day to two services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
+A team that ships twice a day to three services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
 
 ## Complexity and simplification
 
-Microservices do not remove complexity, they move it: from inside a codebase to between services, where it is harder to see. GoCart's wager is that two services is the least that demonstrates the benefits, and the cost is visible in the code: the saga, the reconciler, idempotency and retries are exactly the complexity that a single process gets for free from a transaction. Anything added to a boundary should earn its place against that bill.
+Microservices do not remove complexity, they move it: from inside a codebase to between services, where it is harder to see. GoCart's wager is that three services is the least that demonstrates the benefits (the third, Payment, is where the cost became real), and the cost is visible in the code: the saga and its compensations, the reconciler, idempotency, tombstones and retries are exactly the complexity that a single process gets for free from a transaction. Anything added to a boundary should earn its place against that bill.

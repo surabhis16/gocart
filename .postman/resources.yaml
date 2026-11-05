@@ -1,0 +1,9 @@
+# Use this workspace to collaborate
+workspace:
+  id: b495336e-b231-47b9-8001-545537784f35
+
+localResources:
+  specs:
+    - ../docs/openapi/order.yaml
+    - ../docs/openapi/payment.yaml
+    - ../docs/openapi/product.yaml

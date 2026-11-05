@@ -1,20 +1,26 @@
 # GoCart, locally:    docker compose up --build
-# Then try it:        ./scripts/smoke.sh        ./scripts/outage-demo.sh
+# Then try it:        ./scripts/smoke.sh   ./scripts/outage-demo.sh   ./scripts/oversell-demo.sh
 # Start from scratch: docker compose down -v
 #
 # With Cassandra as the Order service's event store (Unit IV):
 #   docker compose -f docker-compose.yml -f docker-compose.cassandra.yml up --build
 name: gocart
 
-x-version: &version ${VERSION:-0.1.0}
+# One shared secret for the admin endpoints (shipping, stock, the event log).
+# It is a demo default; a real deployment injects a secret, never a literal.
+x-admin: &admin-key ${ADMIN_KEY:-dev-admin-key}
+
+x-version: &version ${VERSION:-0.2.0}
 
 services:
   product-service:
-    image: gocart/product-service:${VERSION:-0.1.0}
+    image: gocart/product-service:${VERSION:-0.2.0}
     build:
       context: ./product-service
       args:
         VERSION: *version
+    environment:
+      ADMIN_KEY: *admin-key
     ports:
       - "8080:8080"
     volumes:
@@ -23,23 +29,44 @@ services:
     # Each service owns its data: there is no database both can reach.
 
   order-service:
-    image: gocart/order-service:${VERSION:-0.1.0}
+    image: gocart/order-service:${VERSION:-0.2.0}
     build:
       context: ./order-service
       args:
         VERSION: *version
     environment:
       PRODUCT_URL: http://product-service:8080
+      PAYMENT_URL: http://payment-service:8082
       RECONCILE_INTERVAL: 5s
+      PAYMENT_TTL: ${PAYMENT_TTL:-15m} # how long stock is held for an unpaid order
+      ADMIN_KEY: *admin-key
     ports:
       - "8081:8081"
     volumes:
       - order-data:/data
     depends_on:
       product-service:
-        condition: service_healthy # start-up order only; the Order service also copes with Product going away later
+        condition: service_healthy # start-up order only; the Order service also copes with either going away later
+      payment-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-service:
+    image: gocart/payment-service:${VERSION:-0.2.0}
+    build:
+      context: ./payment-service
+      args:
+        VERSION: *version
+    environment:
+      SLOW_DELAY: ${SLOW_DELAY:-5s} # how long a tok_slow charge takes (a demo knob)
+      ADMIN_KEY: *admin-key
+    ports:
+      - "8082:8082"
+    volumes:
+      - payment-data:/data
     restart: unless-stopped
 
 volumes:
   product-data:
   order-data:
+  payment-data:

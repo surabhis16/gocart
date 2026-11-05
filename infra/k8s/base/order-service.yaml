@@ -44,7 +44,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: order-service
-          image: gocart/order-service:0.1.0
+          image: gocart/order-service:0.2.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -54,10 +54,14 @@ spec:
             - { name: DATA_DIR, value: /data }
             - { name: LOG_LEVEL, value: info }
             - { name: PRODUCT_URL, value: "http://product-service:8080" }
+            - { name: PAYMENT_URL, value: "http://payment-service:8082" }
+            - { name: PAYMENT_TTL, value: 15m }
             - { name: RECONCILE_INTERVAL, value: 5s }
-          # Readiness deliberately does not check the Product service: an order
-          # placed while it is down is still accepted (202) and finished later,
-          # so being unable to reach Product is not a reason to stop taking orders.
+            - { name: ADMIN_KEY, valueFrom: { secretKeyRef: { name: gocart-admin, key: admin-key } } }
+          # Readiness deliberately checks neither the Product nor the Payment
+          # service: an order placed while one is down is still accepted (202)
+          # and finished later, so being unable to reach them is not a reason
+          # to stop taking orders.
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 5

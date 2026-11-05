@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: GoCart Order Service
-  version: 0.1.0
+  version: 0.2.0
   description: |
     The Order bounded context: placing, cancelling and shipping orders.
 
@@ -9,15 +9,25 @@ info:
     it. `GET /orders/{id}/events` shows that list; every other read is served
     from a read model built from it (CQRS).
 
-    **Placing an order talks to the Product service**, which reserves stock. The
-    two services cannot share a transaction, so there are three honest outcomes
-    rather than two:
+    **Placing an order is a saga across two services.** The Product service
+    reserves stock, then the Payment service takes payment. They cannot share a
+    transaction, so there are several honest outcomes rather than two:
 
     | Outcome | Status | Meaning |
     |---|---|---|
-    | confirmed | `201` | Stock reserved, prices fixed. |
-    | rejected | `409` | The Product service said no (`order-rejected`). The order is still recorded and visible. |
-    | placed | `202` | The Product service did not answer. The order is safe and is completed automatically; poll `Location`. |
+    | confirmed | `201` | Stock reserved, prices fixed, payment taken. |
+    | rejected | `409` | The Product service said no (`order-rejected`). Nothing was held or charged. |
+    | payment failed | `402` | The card was declined (`payment-declined`). The stock has been given back. Definite: do not retry with the same card. |
+    | placed / awaiting payment | `202` | The Product or Payment service did not answer. The order is safe and is completed automatically; poll `Location`. |
+
+    In every case the order is recorded and visible at `GET /orders/{id}`.
+    An order that stays `awaiting_payment` past the time limit becomes
+    `expired` and its stock is released.
+
+    **Payment tokens.** `payment_token` is an opaque provider token such as
+    `tok_visa` (see the Payment service spec for the test tokens). A card
+    number is refused with `422` before anything is stored, and the token is
+    never returned by any endpoint.
 
     **Retries.** Send an `Idempotency-Key` header with `POST /orders`. Repeating
     the same key with the same request returns the same order (`200`) instead
@@ -55,15 +65,32 @@ paths:
                   status:
                     type: string
                     example: ok
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Request counts and latency by route pattern, plus this service's own
+        gauges. Plain text in the Prometheus exposition format. Not
+        authenticated: it holds counts only, and is meant to be reachable by the
+        scraper, not by the internet.
+      responses:
+        "200":
+          description: Metrics in the Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
   /orders:
     post:
       tags: [orders]
       operationId: placeOrder
       summary: Place an order
       description: |
-        Records the order, then asks the Product service to reserve stock for
-        every line, all or none. See the outcomes table at the top of this
-        document.
+        Records the order, asks the Product service to reserve stock for every
+        line (all or none), then asks the Payment service to charge the total.
+        See the outcomes table at the top of this document.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -92,8 +119,9 @@ paths:
                 $ref: "#/components/schemas/Order"
         "202":
           description: |
-            Accepted but not yet decided, because the Product service could not
-            be reached. The order is durable and will be settled automatically.
+            Accepted but not yet decided, because the Product or Payment service
+            could not be reached. `status` is `placed` or `awaiting_payment`. The
+            order is durable and will be settled automatically.
           headers:
             Location:
               schema:
@@ -108,18 +136,32 @@ paths:
                 $ref: "#/components/schemas/Order"
         "400":
           $ref: "#/components/responses/MalformedBody"
+        "402":
+          description: |
+            `payment-declined`: the card was declined. `order_id` and
+            `decline_code` (`card_declined`, `insufficient_funds`,
+            `expired_card`) say which order and why. The order is recorded as
+            `payment_failed` and its stock has been released. Repeating the
+            same `Idempotency-Key` returns this answer again.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "409":
           description: |
             `order-rejected`: the Product service refused (not enough stock,
             unknown product). `order_id` and `reason` say which order and why;
-            the order stays visible at `GET /orders/{id}`.
+            the order stays visible at `GET /orders/{id}`. Also `order-expired`,
+            when an old `Idempotency-Key` is replayed for an order that was not
+            paid in time.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "422":
           description: |
-            The request is invalid (`validation-failed`), or the
+            The request is invalid (`validation-failed`, including a missing or
+            malformed `payment_token`), or the
             `Idempotency-Key` was already used for a different request
             (`idempotency-key-reuse`).
           content:
@@ -182,6 +224,8 @@ paths:
     get:
       tags: [orders]
       operationId: getOrderEvents
+      security:
+        - adminKey: []
       summary: Get an order's event history (the event store)
       description: |
         The facts the order's state was derived from, oldest first. This reads
@@ -189,6 +233,10 @@ paths:
       parameters:
         - $ref: "#/components/parameters/OrderId"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Unauthorized"
         "200":
           description: The order's events.
           content:
@@ -211,10 +259,12 @@ paths:
       operationId: cancelOrder
       summary: Cancel a confirmed order
       description: |
-        Records the cancellation and returns the reserved stock to the Product
-        service. If the Product service cannot be reached, the cancellation
-        still succeeds and `stock_release_pending` is `true` until the release
-        has been completed automatically.
+        Records the cancellation, returns the reserved stock to the Product
+        service and refunds the payment. If either service cannot be reached the
+        cancellation still succeeds, and `stock_release_pending` or
+        `refund_pending` is `true` until that step has been completed
+        automatically. The two are independent: one being down does not delay
+        the other.
       parameters:
         - $ref: "#/components/parameters/OrderId"
       requestBody:
@@ -247,10 +297,16 @@ paths:
     post:
       tags: [lifecycle]
       operationId: shipOrder
+      security:
+        - adminKey: []
       summary: Mark a confirmed order as shipped
       parameters:
         - $ref: "#/components/parameters/OrderId"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Unauthorized"
         "200":
           description: The shipped order.
           content:
@@ -306,13 +362,32 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: |
+        `unauthorized`: the admin key is missing or wrong. Or `admin-disabled`
+        (403): the service was started without an admin key, so admin operations
+        are refused.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  securitySchemes:
+    adminKey:
+      type: http
+      scheme: bearer
+      description: |
+        The shop's own shared secret (`ADMIN_KEY`), sent as
+        `Authorization: Bearer <key>`. It says "this is the shop's tooling", not
+        "this is customer X"; there are no customer logins yet.
   schemas:
     Status:
       type: string
-      enum: [placed, confirmed, rejected, cancelled, shipped]
+      enum: [placed, awaiting_payment, confirmed, rejected, payment_failed, expired, cancelled, shipped]
       description: |
-        `placed` waiting for the Product service; `confirmed` stock reserved;
-        `rejected` refused by the Product service; `cancelled`; `shipped`.
+        `placed` waiting for the Product service; `awaiting_payment` stock held,
+        waiting for the Payment service; `confirmed` stock held and paid for;
+        `rejected` refused by the Product service; `payment_failed` card
+        declined; `expired` not paid in time; `cancelled`; `shipped`.
     Item:
       type: object
       required: [product_id, quantity]
@@ -328,7 +403,7 @@ components:
           example: 2
     PlaceOrderRequest:
       type: object
-      required: [customer_id, items]
+      required: [customer_id, payment_token, items]
       additionalProperties: false
       properties:
         customer_id:
@@ -336,6 +411,11 @@ components:
           minLength: 1
           maxLength: 64
           example: cust_asha
+        payment_token:
+          type: string
+          pattern: "^tok_[a-z0-9_]{1,40}$"
+          description: Opaque provider token for the payment method. Never a card number.
+          example: tok_visa
         items:
           type: array
           minItems: 1
@@ -384,9 +464,19 @@ components:
           description: "One of `insufficient_stock`, `unknown_product`, `invalid_items`, `refused`."
         reject_detail:
           type: string
+        payment_reference:
+          type: string
+          description: The provider's id for the charge. Present once payment is taken.
+          example: pay_3f9a1c07d2e84b56
+        decline_code:
+          type: string
+          description: "Present on `payment_failed`: one of `card_declined`, `insufficient_funds`, `expired_card`."
         stock_release_pending:
           type: boolean
-          description: Present and `true` while a cancelled order's stock has not yet been returned.
+          description: Present and `true` while an order that ended without using its stock (cancelled, payment_failed, expired) has not yet had it returned.
+        refund_pending:
+          type: boolean
+          description: Present and `true` while a cancelled or expired order's charge has not yet been voided or refunded.
         placed_at:
           type: string
           format: date-time
@@ -405,7 +495,21 @@ components:
           description: Position in this order's stream, starting at 1.
         type:
           type: string
-          enum: [OrderPlaced, OrderConfirmed, OrderRejected, OrderCancelled, StockReleased, OrderShipped]
+          enum:
+            - OrderPlaced
+            - StockReserved
+            - OrderRejected
+            - PaymentCaptured
+            - PaymentDeclined
+            - ReservationExpired
+            - OrderCancelled
+            - StockReleased
+            - PaymentRefunded
+            - OrderShipped
+            - OrderConfirmed
+          description: |
+            `OrderConfirmed` appears only in logs written by version 0.1, before
+            payments existed. It is never written by current code.
         at:
           type: string
           format: date-time
@@ -417,8 +521,9 @@ components:
       description: |
         RFC 9457 problem details. `type` is `urn:gocart:problem:` followed by one
         of `invalid-request`, `validation-failed`, `not-found`, `order-rejected`,
-        `invalid-state`, `idempotency-key-reuse`, `concurrent-modification`,
-        `payload-too-large` or `internal`.
+        `payment-declined`, `order-expired`, `invalid-state`,
+        `idempotency-key-reuse`, `concurrent-modification`, `payload-too-large`,
+        `unauthorized`, `admin-disabled` or `internal`.
       required: [type, title, status]
       properties:
         type:
@@ -439,3 +544,6 @@ components:
         reason:
           type: string
           description: Present on `order-rejected`.
+        decline_code:
+          type: string
+          description: Present on `payment-declined`.

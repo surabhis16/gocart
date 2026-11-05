@@ -4,6 +4,7 @@ sequenceDiagram
     participant O as Order service
     participant L as Event log
     participant P as Product service
+    participant Y as Payment service
 
     C->>O: POST /orders
     O->>L: append OrderPlaced (v1)
@@ -15,6 +16,9 @@ sequenceDiagram
     Note over P: comes back
     O->>P: POST /reservations  (same order id)
     P-->>O: 201 reserved (exactly once)
-    O->>L: append OrderConfirmed (v2)
+    O->>L: append StockReserved (v2)
+    O->>Y: POST /charges  (same order id)
+    Y-->>O: 201 approved (exactly once)
+    O->>L: append PaymentCaptured (v3)
     C->>O: GET /orders/{id}
     O-->>C: 200, status confirmed

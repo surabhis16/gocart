@@ -7,7 +7,7 @@ resources:
 images:
   # The Cassandra-enabled build is a different binary, so it is a different tag.
   - name: localhost:5000/gocart/order-service
-    newTag: 0.1.0-cassandra
+    newTag: 0.2.0-cassandra
 patches:
   - target:
       kind: Deployment

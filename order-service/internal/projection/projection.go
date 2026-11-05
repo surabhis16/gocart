@@ -27,7 +27,10 @@ type View struct {
 	Currency            string              `json:"currency,omitempty"`
 	RejectReason        string              `json:"reject_reason,omitempty"`
 	RejectDetail        string              `json:"reject_detail,omitempty"`
+	PaymentReference    string              `json:"payment_reference,omitempty"`
+	DeclineCode         string              `json:"decline_code,omitempty"`
 	StockReleasePending bool                `json:"stock_release_pending,omitempty"`
+	RefundPending       bool                `json:"refund_pending,omitempty"`
 	PlacedAt            time.Time           `json:"placed_at"`
 	UpdatedAt           time.Time           `json:"updated_at"`
 	Version             int                 `json:"version"`
@@ -133,22 +136,52 @@ func (p *Projection) List(f Filter) []View {
 	return out
 }
 
-// Pending lists orders that something still has to finish: placed orders that
-// have waited at least grace for the Product service, and cancelled orders
-// whose stock has not been released yet. Oldest first.
-func (p *Projection) Pending(now time.Time, grace time.Duration) (placed, release []string) {
+// Work is what something still has to finish, oldest first.
+type Work struct {
+	Placed  []string // waiting for the Product service
+	Unpaid  []string // stock held, waiting for the Payment service
+	Release []string // stock owed back to the Product service
+	Refund  []string // a charge owed a void at the Payment service
+}
+
+// Pending lists the orders that need work. Placed and unpaid orders are listed
+// only after waiting at least grace, so the reconciler does not race the
+// request that is still handling them. An order can appear in both Release
+// and Refund: the two debts are settled independently.
+func (p *Projection) Pending(now time.Time, grace time.Duration) Work {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	var pl, rl []domain.Order
+	var pl, up, rl, rf []domain.Order
 	for _, o := range p.orders {
+		waited := now.Sub(o.UpdatedAt) >= grace
 		switch {
-		case o.Status == domain.StatusPlaced && now.Sub(o.UpdatedAt) >= grace:
+		case o.Status == domain.StatusPlaced && waited:
 			pl = append(pl, o)
-		case o.ReleasePending:
+		case o.Status == domain.StatusAwaitingPayment && waited:
+			up = append(up, o)
+		}
+		if o.ReleasePending {
 			rl = append(rl, o)
 		}
+		if o.RefundPending {
+			rf = append(rf, o)
+		}
 	}
-	return idsOldestFirst(pl), idsOldestFirst(rl)
+	return Work{Placed: idsOldestFirst(pl), Unpaid: idsOldestFirst(up), Release: idsOldestFirst(rl), Refund: idsOldestFirst(rf)}
+}
+
+// StatusCounts returns how many orders are in each status, for /metrics.
+func (p *Projection) StatusCounts() map[domain.Status]int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[domain.Status]int, len(domain.AllStatuses))
+	for _, st := range domain.AllStatuses {
+		out[st] = 0
+	}
+	for _, o := range p.orders {
+		out[o.Status]++
+	}
+	return out
 }
 
 // Len is the number of orders in the view.
@@ -178,7 +211,8 @@ func viewOf(o domain.Order) View {
 		Items:      append([]domain.PricedItem(nil), o.Items...),
 		TotalMinor: o.TotalMinor, Currency: o.Currency,
 		RejectReason: o.RejectReason, RejectDetail: o.RejectDetail,
-		StockReleasePending: o.ReleasePending,
-		PlacedAt:            o.PlacedAt, UpdatedAt: o.UpdatedAt, Version: o.Version,
+		PaymentReference: o.PaymentReference, DeclineCode: o.DeclineCode,
+		StockReleasePending: o.ReleasePending, RefundPending: o.RefundPending,
+		PlacedAt: o.PlacedAt, UpdatedAt: o.UpdatedAt, Version: o.Version,
 	}
 }

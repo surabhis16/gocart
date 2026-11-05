@@ -5,6 +5,7 @@
 //	PORT        listen port                      (default 8080)
 //	DATA_DIR    where catalog.json is kept       (default ./data)
 //	SEED_DATA   load a demo catalogue if empty   (default true)
+//	ADMIN_KEY    shared secret for admin endpoints   (unset: they refuse everything)
 //	LOG_LEVEL   debug | info | warn | error      (default info)
 //
 // Run with -healthcheck to probe a running instance and exit 0 or 1. The
@@ -63,7 +64,7 @@ func run(log *slog.Logger, port string) error {
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           httpapi.New(store, log).Handler(),
+		Handler:           httpapi.New(store, log, apiOptions(log)...).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -92,6 +93,16 @@ func run(log *slog.Logger, port string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// apiOptions reads the admin key. Without one the admin endpoints refuse every
+// request, so forgetting to set it fails closed rather than open.
+func apiOptions(log *slog.Logger) []httpapi.Option {
+	key := env("ADMIN_KEY", "")
+	if key == "" {
+		log.Warn("ADMIN_KEY is not set: admin endpoints will refuse every request")
+	}
+	return []httpapi.Option{httpapi.WithAdminKey(key), httpapi.WithVersion(version)}
 }
 
 func probe(port string) int {

@@ -20,6 +20,7 @@ import (
 
 	"gocart/order-service/internal/domain"
 	"gocart/order-service/internal/eventstore"
+	"gocart/order-service/internal/paymentclient"
 	"gocart/order-service/internal/productclient"
 	"gocart/order-service/internal/service"
 )
@@ -67,10 +68,46 @@ func (s *stubProducts) Release(_ context.Context, id string) error {
 	return nil
 }
 
+// stubPayments is a Payment service with the same contract as the real one.
+type stubPayments struct {
+	mu      sync.Mutex
+	down    bool
+	charged map[string]bool
+	voided  map[string]bool
+}
+
+func (s *stubPayments) Charge(_ context.Context, id string, _ int64, _, token string) (paymentclient.Charge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.down {
+		return paymentclient.Charge{}, fmt.Errorf("%w: down", paymentclient.ErrUnavailable)
+	}
+	if s.voided[id] {
+		return paymentclient.Charge{}, paymentclient.ErrVoided
+	}
+	if token == "tok_declined" {
+		return paymentclient.Charge{}, &paymentclient.DeclinedError{Code: "insufficient_funds"}
+	}
+	s.charged[id] = true
+	return paymentclient.Charge{OrderID: id, Reference: "pay_" + id}, nil
+}
+
+func (s *stubPayments) Cancel(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.down {
+		return fmt.Errorf("%w: down", paymentclient.ErrUnavailable)
+	}
+	delete(s.charged, id)
+	s.voided[id] = true
+	return nil
+}
+
 type fixture struct {
 	srv  *Server
 	h    http.Handler
 	stub *stubProducts
+	pay  *stubPayments
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -78,15 +115,29 @@ func newFixture(t *testing.T) *fixture {
 	store, _ := eventstore.OpenFile("")
 	stub := &stubProducts{held: map[string]bool{}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc, err := service.New(store, stub, log, service.WithGrace(time.Hour))
+	pay := &stubPayments{charged: map[string]bool{}, voided: map[string]bool{}}
+	svc, err := service.New(store, stub, pay, log, service.WithGrace(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New(svc, log)
-	return &fixture{srv: srv, h: srv.Handler(), stub: stub}
+	srv := New(svc, log, WithAdminKey(testKey))
+	return &fixture{srv: srv, h: srv.Handler(), stub: stub, pay: pay}
 }
 
+const testKey = "test-admin-key"
+
+// do sends a request carrying the admin key; doAnon sends it without one.
 func (f *fixture) do(t *testing.T, method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	return f.doAs(t, method, path, body, append([]string{"Authorization", "Bearer " + testKey}, hdr...)...)
+}
+
+func (f *fixture) doAnon(t *testing.T, method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	return f.doAs(t, method, path, body, hdr...)
+}
+
+func (f *fixture) doAs(t *testing.T, method, path, body string, hdr ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	for i := 0; i+1 < len(hdr); i += 2 {
@@ -121,7 +172,7 @@ func wantProblem(t *testing.T, rec *httptest.ResponseRecorder, status int, typ s
 	return m
 }
 
-const goodOrder = `{"customer_id":"cust_1","items":[{"product_id":"prd_a","quantity":2}]}`
+const goodOrder = `{"customer_id":"cust_1","payment_token":"tok_visa","items":[{"product_id":"prd_a","quantity":2}]}`
 
 func TestPlaceConfirmedIs201WithLocation(t *testing.T) {
 	f := newFixture(t)
@@ -140,7 +191,7 @@ func TestPlaceConfirmedIs201WithLocation(t *testing.T) {
 
 func TestPlaceRejectedIs409ButTheOrderIsStillRecorded(t *testing.T) {
 	f := newFixture(t)
-	rec := f.do(t, "POST", "/orders", `{"customer_id":"c","items":[{"product_id":"prd_gone","quantity":1}]}`)
+	rec := f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"tok_visa","items":[{"product_id":"prd_gone","quantity":1}]}`)
 	p := wantProblem(t, rec, 409, "order-rejected")
 	if p["reason"] != "insufficient_stock" || !strings.Contains(p["detail"].(string), "prd_gone") {
 		t.Errorf("problem = %v", p)
@@ -167,6 +218,52 @@ func TestPlaceDuringOutageIs202AndSettlesLater(t *testing.T) {
 	}
 }
 
+func TestPlaceDuringPaymentOutageIs202AwaitingPayment(t *testing.T) {
+	f := newFixture(t)
+	f.pay.down = true
+	rec := f.do(t, "POST", "/orders", goodOrder)
+	if rec.Code != 202 {
+		t.Fatalf("status %d, want 202\n%s", rec.Code, rec.Body)
+	}
+	if asMap(t, rec)["status"] != "awaiting_payment" || rec.Header().Get("Location") == "" {
+		t.Errorf("body = %s headers = %v", rec.Body, rec.Header())
+	}
+}
+
+func TestDeclinedCardIs402ButTheOrderIsStillRecorded(t *testing.T) {
+	f := newFixture(t)
+	rec := f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"tok_declined","items":[{"product_id":"prd_a","quantity":1}]}`)
+	p := wantProblem(t, rec, 402, "payment-declined")
+	if p["decline_code"] != "insufficient_funds" {
+		t.Errorf("problem = %v", p)
+	}
+	id := p["order_id"].(string)
+	got := asMap(t, f.do(t, "GET", "/orders/"+id, ""))
+	if got["status"] != "payment_failed" || got["decline_code"] != "insufficient_funds" {
+		t.Errorf("order = %v", got)
+	}
+	if got["stock_release_pending"] == true {
+		t.Error("the stock should already be back")
+	}
+	// Repeating the request with the same key gives the same answer.
+	body := `{"customer_id":"c","payment_token":"tok_declined","items":[{"product_id":"prd_a","quantity":1}]}`
+	first := f.do(t, "POST", "/orders", body, "Idempotency-Key", "k-d")
+	again := f.do(t, "POST", "/orders", body, "Idempotency-Key", "k-d")
+	if first.Code != 402 || again.Code != 402 {
+		t.Errorf("statuses %d, %d, want 402 both times", first.Code, again.Code)
+	}
+}
+
+func TestPaymentTokenNeverAppearsInAResponse(t *testing.T) {
+	f := newFixture(t)
+	id := asMap(t, f.do(t, "POST", "/orders", goodOrder))["id"].(string)
+	for _, path := range []string{"/orders", "/orders/" + id, "/orders/" + id + "/events"} {
+		if body := f.do(t, "GET", path, "").Body.String(); strings.Contains(body, "tok_") {
+			t.Errorf("GET %s leaked the payment token: %s", path, body)
+		}
+	}
+}
+
 func TestIdempotentRetryIs200AndDoesNotCreateASecondOrder(t *testing.T) {
 	f := newFixture(t)
 	first := f.do(t, "POST", "/orders", goodOrder, "Idempotency-Key", "k-1")
@@ -182,31 +279,33 @@ func TestIdempotentRetryIs200AndDoesNotCreateASecondOrder(t *testing.T) {
 		t.Errorf("%d orders exist, want 1", len(list))
 	}
 	wantProblem(t, f.do(t, "POST", "/orders",
-		`{"customer_id":"cust_1","items":[{"product_id":"prd_a","quantity":9}]}`, "Idempotency-Key", "k-1"),
+		`{"customer_id":"cust_1","payment_token":"tok_visa","items":[{"product_id":"prd_a","quantity":9}]}`, "Idempotency-Key", "k-1"),
 		422, "idempotency-key-reuse")
 	wantProblem(t, f.do(t, "POST", "/orders", goodOrder, "Idempotency-Key", "bad key!"), 400, "invalid-request")
 }
 
 func TestPlaceValidationAndStrictParsing(t *testing.T) {
 	f := newFixture(t)
-	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"","items":[{"product_id":"a","quantity":1}]}`), 422, "validation-failed")
-	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","items":[]}`), 422, "validation-failed")
-	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","items":[{"product_id":"a","quantity":0}]}`), 422, "validation-failed")
-	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","items":[{"product_id":"a","qty":1}]}`), 400, "invalid-request")
-	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","items":[{"product_id":"a","quantity":1}],"coupon":"X"}`), 400, "invalid-request")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"","payment_token":"tok_visa","items":[{"product_id":"a","quantity":1}]}`), 422, "validation-failed")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"tok_visa","items":[]}`), 422, "validation-failed")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"tok_visa","items":[{"product_id":"a","quantity":0}]}`), 422, "validation-failed")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"tok_visa","items":[{"product_id":"a","qty":1}]}`), 400, "invalid-request")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"tok_visa","items":[{"product_id":"a","quantity":1}],"coupon":"X"}`), 400, "invalid-request")
 	wantProblem(t, f.do(t, "POST", "/orders", `please send me a keyboard`), 400, "invalid-request")
 	wantProblem(t, f.do(t, "POST", "/orders", ``), 400, "invalid-request")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","items":[{"product_id":"a","quantity":1}]}`), 422, "validation-failed")
+	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"c","payment_token":"4242424242424242","items":[{"product_id":"a","quantity":1}]}`), 422, "validation-failed")
 	wantProblem(t, f.do(t, "POST", "/orders", `{"customer_id":"`+strings.Repeat("x", 2<<20)+`"}`), 413, "payload-too-large")
-	if f.stub.reserves != 0 {
-		t.Error("the Product service was called for an invalid request")
+	if f.stub.reserves != 0 || len(f.pay.charged) != 0 {
+		t.Error("another service was called for an invalid request")
 	}
 }
 
 func TestQueryEndpoints(t *testing.T) {
 	f := newFixture(t)
-	a := asMap(t, f.do(t, "POST", "/orders", `{"customer_id":"alice","items":[{"product_id":"prd_a","quantity":1}]}`))["id"].(string)
-	f.do(t, "POST", "/orders", `{"customer_id":"bob","items":[{"product_id":"prd_a","quantity":1}]}`)
-	f.do(t, "POST", "/orders", `{"customer_id":"alice","items":[{"product_id":"prd_gone","quantity":1}]}`)
+	a := asMap(t, f.do(t, "POST", "/orders", `{"customer_id":"alice","payment_token":"tok_visa","items":[{"product_id":"prd_a","quantity":1}]}`))["id"].(string)
+	f.do(t, "POST", "/orders", `{"customer_id":"bob","payment_token":"tok_visa","items":[{"product_id":"prd_a","quantity":1}]}`)
+	f.do(t, "POST", "/orders", `{"customer_id":"alice","payment_token":"tok_visa","items":[{"product_id":"prd_gone","quantity":1}]}`)
 	f.do(t, "POST", "/orders/"+a+"/ship", "")
 
 	count := func(q string) int {
@@ -255,7 +354,7 @@ func TestEventsEndpointShowsTheLog(t *testing.T) {
 		}
 		types = append(types, m["type"].(string))
 	}
-	if got := strings.Join(types, ","); got != "OrderPlaced,OrderConfirmed,OrderCancelled,StockReleased" {
+	if got := strings.Join(types, ","); got != "OrderPlaced,StockReserved,PaymentCaptured,OrderCancelled,StockReleased,PaymentRefunded" {
 		t.Errorf("history = %s", got)
 	}
 	wantProblem(t, f.do(t, "GET", "/orders/ord_nope/events", ""), 404, "not-found")
@@ -283,6 +382,25 @@ func TestCancelAndShipLifecycle(t *testing.T) {
 		t.Errorf("ship: %d %s", rec.Code, rec.Body)
 	}
 	wantProblem(t, f.do(t, "POST", "/orders/"+other+"/cancel", ""), 409, "invalid-state")
+}
+
+func TestCancelReportsThePendingRefund(t *testing.T) {
+	f := newFixture(t)
+	id := asMap(t, f.do(t, "POST", "/orders", goodOrder))["id"].(string)
+	f.pay.down = true
+	o := asMap(t, f.do(t, "POST", "/orders/"+id+"/cancel", ""))
+	if o["status"] != "cancelled" || o["refund_pending"] != true || o["stock_release_pending"] == true {
+		t.Errorf("order = %v", o)
+	}
+}
+
+func TestFilterAcceptsEveryStatus(t *testing.T) {
+	f := newFixture(t)
+	for _, st := range domain.AllStatuses {
+		if rec := f.do(t, "GET", "/orders?status="+string(st), ""); rec.Code != 200 {
+			t.Errorf("status=%s: %d", st, rec.Code)
+		}
+	}
 }
 
 func TestCancelDuringOutageReportsThePendingRelease(t *testing.T) {

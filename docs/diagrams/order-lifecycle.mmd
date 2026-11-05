@@ -1,11 +1,13 @@
 stateDiagram-v2
     direction LR
     [*] --> placed: OrderPlaced
-    placed --> confirmed: OrderConfirmed
+    placed --> awaiting_payment: StockReserved
     placed --> rejected: OrderRejected
+    awaiting_payment --> confirmed: PaymentCaptured
+    awaiting_payment --> payment_failed: PaymentDeclined
+    awaiting_payment --> expired: ReservationExpired
     confirmed --> shipped: OrderShipped
     confirmed --> cancelled: OrderCancelled
-    cancelled --> cancelled: StockReleased
     rejected --> [*]
     shipped --> [*]
     note right of placed
@@ -13,7 +15,16 @@ stateDiagram-v2
         answered yet. Reconciled
         automatically.
     end note
+    note right of awaiting_payment
+        Stock is held, the Payment
+        service has not answered.
+        Retried until it does, or
+        until the time limit.
+    end note
     note right of cancelled
-        Stock release is owed until
-        StockReleased is recorded.
+        Ending without the goods
+        being used leaves a debt.
+        All three owe the stock back.
+        Expired and cancelled also
+        owe a void of the charge.
     end note

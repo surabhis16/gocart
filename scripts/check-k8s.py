@@ -21,6 +21,7 @@ def docs(path):
 
 # 1. Every plain manifest validates against the real Kubernetes schemas.
 manifests = [ROOT/"base/product-service.yaml", ROOT/"base/order-service.yaml",
+             ROOT/"base/payment-service.yaml",
              ROOT/"cassandra/cassandra.yaml", ROOT/"overlays/local/namespace.yaml",
              ROOT/"overlays/staging/namespace.yaml"]
 n = 0
@@ -82,12 +83,31 @@ for (kind, name), d in by_kind.items():
 
 # the Order service must be able to find the Product service by its Service name
 order = by_kind[("Deployment", "order-service")]["spec"]["template"]["spec"]["containers"][0]
-env = {e["name"]: e["value"] for e in order["env"]}
-if env["PRODUCT_URL"] != "http://product-service:8080":
-    problems.append(f"order-service PRODUCT_URL is {env['PRODUCT_URL']}")
-svc = by_kind[("Service", "product-service")]["spec"]["ports"][0]["port"]
-if svc != 8080:
-    problems.append(f"product-service Service port is {svc}, order-service calls 8080")
+env = {e["name"]: e.get("value") for e in order["env"]}
+for var, want_svc, want_port in (("PRODUCT_URL", "product-service", 8080), ("PAYMENT_URL", "payment-service", 8082)):
+    if env.get(var) != f"http://{want_svc}:{want_port}":
+        problems.append(f"order-service {var} is {env.get(var)}, expected http://{want_svc}:{want_port}")
+    port = by_kind[("Service", want_svc)]["spec"]["ports"][0]["port"]
+    if port != want_port:
+        problems.append(f"{want_svc} Service port is {port}, order-service calls {want_port}")
+
+# Every secret a workload reads must be produced by every overlay that deploys it.
+needed = set()
+for (kd, _), d in by_kind.items():
+    if kd == "Deployment":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            for e in c.get("env", []):
+                ref = e.get("valueFrom", {}).get("secretKeyRef")
+                if ref:
+                    needed.add((ref["name"], ref["key"]))
+for ov in ("overlays/local", "overlays/staging"):
+    gen = {}
+    for g in yaml.safe_load((ROOT/ov/"kustomization.yaml").read_text()).get("secretGenerator", []):
+        for lit in g.get("literals", []):
+            gen[(g["name"], lit.split("=", 1)[0])] = True
+    for name, key in needed:
+        if (name, key) not in gen:
+            problems.append(f"{ov} does not generate secret {name}/{key}, which a Deployment reads")
 
 # 3. Kustomizations: every referenced path exists, images name real images, and
 #    the JSON-patch path used by the cassandra overlay resolves in the base.

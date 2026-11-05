@@ -4,3 +4,9 @@ namespace: gocart-local
 resources:
   - namespace.yaml
   - ../../base
+secretGenerator:
+  - name: gocart-admin
+    literals:
+      - admin-key=dev-admin-key # DEMO VALUE. See docs/operations.md before using this anywhere real.
+    options:
+      disableNameSuffixHash: true

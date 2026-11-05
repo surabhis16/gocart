@@ -1,18 +1,26 @@
 // Package service is the Order service's command side: it decides, stores
-// events, and coordinates with the Product service.
+// events, and coordinates with the Product and Payment services.
 //
-// The two services cannot share a transaction, so an order is a small saga:
+// The services cannot share a transaction, so an order is a saga: a sequence of
+// local steps, each stored as an event, with a compensating step for every one
+// that cannot simply be forgotten.
 //
-//  1. store OrderPlaced               (the order exists, durably)
-//  2. ask Product to reserve stock    (idempotent per order id)
-//  3. store OrderConfirmed or OrderRejected
+//  1. store OrderPlaced                (the order exists, durably)
+//  2. Product: reserve stock           (idempotent per order id)  -> StockReserved
+//  3. Payment: charge the customer     (idempotent per order id)  -> PaymentCaptured
 //
-// A crash, timeout or outage between any two steps leaves the order "placed",
-// which is a real, queryable state rather than a corrupt one. Reconcile finds
-// such orders and finishes them. Because step 2 is idempotent, finishing is
-// always safe, and nothing is ever double-reserved. Cancelling works the same
-// way in reverse: OrderCancelled is stored first, and the stock release that
-// follows is retried until it lands.
+// and the ways it can end badly, each with what it owes back:
+//
+//	Product says no                      -> OrderRejected          (nothing held, nothing owed)
+//	card declined                        -> PaymentDeclined        (stock owed back)
+//	nobody pays within the time limit    -> ReservationExpired     (stock owed back, charge voided)
+//	customer cancels a paid order        -> OrderCancelled         (stock owed back, charge refunded)
+//
+// A crash, timeout or outage between any two steps leaves the order in a real,
+// queryable state (placed, awaiting_payment, or cancelled with a debt) rather
+// than a corrupt one. Reconcile finds such orders and finishes them. Every
+// remote step is idempotent per order id, so finishing is always safe: nothing
+// is ever double-reserved or double-charged.
 package service
 
 import (
@@ -30,6 +38,7 @@ import (
 
 	"gocart/order-service/internal/domain"
 	"gocart/order-service/internal/eventstore"
+	"gocart/order-service/internal/paymentclient"
 	"gocart/order-service/internal/productclient"
 	"gocart/order-service/internal/projection"
 	"gocart/order-service/internal/reqid"
@@ -51,17 +60,27 @@ type Products interface {
 	Release(ctx context.Context, orderID string) error
 }
 
+// Payments is what the Order service needs from the Payment service.
+type Payments interface {
+	Charge(ctx context.Context, orderID string, amountMinor int64, currency, token string) (paymentclient.Charge, error)
+	Cancel(ctx context.Context, orderID string) error
+}
+
 // Service coordinates orders.
 type Service struct {
 	store    eventstore.Store
 	proj     *projection.Projection
 	products Products
+	payments Payments
 	log      *slog.Logger
 	now      func() time.Time
 
-	// grace is how long a placed order may wait before Reconcile picks it up,
-	// so that Reconcile does not race the request that is still handling it.
+	// grace is how long an order may wait before Reconcile picks it up, so that
+	// Reconcile does not race the request that is still handling it.
 	grace time.Duration
+	// paymentTTL is how long stock is held for an order nobody has paid for.
+	// Without it, a customer who abandons checkout holds stock forever.
+	paymentTTL time.Duration
 
 	commitMu sync.Mutex // keeps "append" and "update the view" in the same order
 }
@@ -75,11 +94,14 @@ func WithClock(now func() time.Time) Option { return func(s *Service) { s.now = 
 // WithGrace sets how long a placed order is left alone before reconciliation.
 func WithGrace(d time.Duration) Option { return func(s *Service) { s.grace = d } }
 
+// WithPaymentTTL sets how long stock is held while an order awaits payment.
+func WithPaymentTTL(d time.Duration) Option { return func(s *Service) { s.paymentTTL = d } }
+
 // New builds a Service and rebuilds the read model from the event log.
-func New(store eventstore.Store, products Products, log *slog.Logger, opts ...Option) (*Service, error) {
+func New(store eventstore.Store, products Products, payments Payments, log *slog.Logger, opts ...Option) (*Service, error) {
 	s := &Service{
-		store: store, proj: projection.New(), products: products, log: log,
-		now: time.Now, grace: 10 * time.Second,
+		store: store, proj: projection.New(), products: products, payments: payments, log: log,
+		now: time.Now, grace: 10 * time.Second, paymentTTL: 15 * time.Minute,
 	}
 	for _, o := range opts {
 		o(s)
@@ -104,18 +126,19 @@ type PlaceResult struct {
 	Replayed bool // an earlier request with the same Idempotency-Key was returned
 }
 
-// Place accepts an order and tries to reserve its stock.
+// Place accepts an order, reserves its stock and takes payment.
 //
-// The returned order is confirmed, rejected, or (if the Product service could
-// not be reached) still placed, in which case Reconcile will finish it. An
-// Idempotency-Key makes retries by the customer safe: the same key and the
-// same request returns the same order instead of creating a second one.
-func (s *Service) Place(ctx context.Context, customerID, idempotencyKey string, items []domain.Item) (PlaceResult, error) {
+// The returned order is confirmed, rejected (no stock), payment_failed (card
+// declined), or, if a service could not be reached, still placed or
+// awaiting_payment, in which case Reconcile will finish it. An Idempotency-Key
+// makes retries by the customer safe: the same key and the same request
+// returns the same order instead of creating a second one.
+func (s *Service) Place(ctx context.Context, customerID, idempotencyKey, paymentToken string, items []domain.Item) (PlaceResult, error) {
 	id := newOrderID()
 	if idempotencyKey != "" {
 		id = orderIDFromKey(customerID, idempotencyKey)
 	}
-	first, err := domain.Place(id, customerID, items, s.now())
+	first, err := domain.Place(id, customerID, items, paymentToken, s.now())
 	if err != nil {
 		return PlaceResult{}, err
 	}
@@ -155,12 +178,12 @@ func (s *Service) replay(ctx context.Context, id string, existing []domain.Event
 	if err := json.Unmarshal(wanted.Data, &want); err != nil {
 		return PlaceResult{}, err
 	}
-	if was.CustomerID != want.CustomerID || !sameItems(was.Items, want.Items) {
+	if was.CustomerID != want.CustomerID || was.PaymentToken != want.PaymentToken || !sameItems(was.Items, want.Items) {
 		return PlaceResult{}, ErrIdempotencyConflict
 	}
-	// Give an order that is still placed another chance, since the customer
-	// is retrying precisely because they did not get an answer.
-	if v, ok := s.proj.Get(id); ok && v.Status == domain.StatusPlaced {
+	// Give an order that is still unfinished another chance, since the
+	// customer is retrying precisely because they did not get an answer.
+	if v, ok := s.proj.Get(id); ok && (v.Status == domain.StatusPlaced || v.Status == domain.StatusAwaitingPayment) {
 		if view, err := s.settle(ctx, id); err == nil {
 			return PlaceResult{Order: view, Replayed: true}, nil
 		}
@@ -172,7 +195,8 @@ func (s *Service) replay(ctx context.Context, id string, existing []domain.Event
 	return PlaceResult{Order: view, Replayed: true}, nil
 }
 
-// Cancel cancels a confirmed order and returns its stock to the shelf.
+// Cancel cancels a confirmed order, returns its stock to the shelf and refunds
+// the payment.
 func (s *Service) Cancel(ctx context.Context, id, reason string) (projection.View, error) {
 	if _, err := s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
 		e, err := o.Cancel(reason, s.now())
@@ -181,8 +205,8 @@ func (s *Service) Cancel(ctx context.Context, id, reason string) (projection.Vie
 		return projection.View{}, err
 	}
 	s.log.Info("order cancelled", "order_id", id, "request_id", reqid.From(ctx))
-	if err := s.releaseStock(ctx, id); err != nil {
-		s.log.Warn("stock release deferred to reconciler", "order_id", id, "err", err, "request_id", reqid.From(ctx))
+	if err := s.compensate(ctx, id); err != nil {
+		s.log.Warn("compensation deferred to reconciler", "order_id", id, "err", err, "request_id", reqid.From(ctx))
 	}
 	return s.view(id)
 }
@@ -198,13 +222,14 @@ func (s *Service) Ship(ctx context.Context, id string) (projection.View, error) 
 	return s.view(id)
 }
 
-// Reconcile finishes work that was interrupted: it settles placed orders the
-// Product service never answered, and releases stock for cancelled orders
-// whose release never landed. It is safe to run at any time, as often as you
-// like, from any number of replicas of this service's request handlers.
-func (s *Service) Reconcile(ctx context.Context) (settled, released int) {
-	placed, release := s.proj.Pending(s.now(), s.grace)
-	for _, id := range placed {
+// Reconcile finishes work that was interrupted. It settles placed orders the
+// Product service never answered, finishes payment for orders still awaiting
+// it (or expires them once the time limit has passed), and pays back whatever
+// stock or money a finished order still owes. It is safe to run at any time,
+// as often as you like.
+func (s *Service) Reconcile(ctx context.Context) (settled, compensated int) {
+	w := s.proj.Pending(s.now(), s.grace)
+	for _, id := range w.Placed {
 		if ctx.Err() != nil {
 			return
 		}
@@ -214,18 +239,40 @@ func (s *Service) Reconcile(ctx context.Context) (settled, released int) {
 		}
 		settled++
 	}
-	for _, id := range release {
+	for _, id := range w.Unpaid {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := s.releaseStock(ctx, id); err != nil {
-			s.log.Warn("reconcile: stock release still pending", "order_id", id, "err", err)
+		if s.expireIfStale(ctx, id) {
+			settled++
 			continue
 		}
-		released++
+		if _, err := s.settle(ctx, id); err != nil {
+			s.log.Warn("reconcile: payment still unsettled", "order_id", id, "err", err)
+			continue
+		}
+		settled++
 	}
-	if settled+released > 0 {
-		s.log.Info("reconcile finished work", "settled", settled, "released", released)
+	// Re-read: the loops above may have created new debts (a decline or an
+	// expiry owes stock), and those should not wait a whole interval.
+	w = s.proj.Pending(s.now(), s.grace)
+	seen := map[string]bool{}
+	for _, id := range append(append([]string(nil), w.Release...), w.Refund...) {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.compensate(ctx, id); err != nil {
+			s.log.Warn("reconcile: compensation still pending", "order_id", id, "err", err)
+			continue
+		}
+		compensated++
+	}
+	if settled+compensated > 0 {
+		s.log.Info("reconcile finished work", "settled", settled, "compensated", compensated)
 	}
 	return
 }
@@ -244,38 +291,55 @@ func (s *Service) RunReconciler(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// settle asks the Product service about a placed order and records its answer.
-// Calling it on an order that is no longer placed is a harmless no-op.
+// settle drives an order as far forward as it can go: reserve stock if that
+// has not happened, then take payment if that has not happened. It stops, with
+// an error, at the first service that does not answer; the order stays in the
+// state it reached, and a later call carries on from there. Calling it on an
+// order that has finished is a harmless no-op.
 func (s *Service) settle(ctx context.Context, id string) (projection.View, error) {
 	o, err := s.load(ctx, id)
 	if err != nil {
 		return projection.View{}, err
 	}
-	if o.Status != domain.StatusPlaced {
-		return s.view(id)
+	if o.Status == domain.StatusPlaced {
+		if o, err = s.reserve(ctx, o); err != nil {
+			v, _ := s.view(id)
+			return v, err
+		}
 	}
+	if o.Status == domain.StatusAwaitingPayment {
+		if err = s.pay(ctx, o); err != nil {
+			v, _ := s.view(id)
+			return v, err
+		}
+	}
+	return s.view(id)
+}
+
+// reserve asks the Product service to hold stock and records the answer.
+func (s *Service) reserve(ctx context.Context, o domain.Order) (domain.Order, error) {
 	items := make([]domain.Item, len(o.Items))
 	for i, it := range o.Items {
 		items[i] = domain.Item{ProductID: it.ProductID, Quantity: it.Quantity}
 	}
-
-	res, err := s.products.Reserve(ctx, id, items)
+	res, err := s.products.Reserve(ctx, o.ID, items)
 	var rejected *productclient.RejectedError
 	switch {
 	case err == nil:
-		_, err = s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
+		o, err = s.mutate(ctx, o.ID, func(o domain.Order) (*domain.Event, error) {
 			if o.Status != domain.StatusPlaced {
 				return nil, nil // someone else got here first
 			}
-			e, err := o.Confirm(res.Items, res.Currency, s.now())
+			e, err := o.ReserveStock(res.Items, res.Currency, s.now())
 			return &e, err
 		})
 		if err != nil {
-			return projection.View{}, err
+			return o, err
 		}
-		s.log.Info("order confirmed", "order_id", id, "request_id", reqid.From(ctx))
+		s.log.Info("stock reserved", "order_id", o.ID, "total_minor", o.TotalMinor, "request_id", reqid.From(ctx))
+		return o, nil
 	case errors.As(err, &rejected):
-		_, err = s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
+		o, err = s.mutate(ctx, o.ID, func(o domain.Order) (*domain.Event, error) {
 			if o.Status != domain.StatusPlaced {
 				return nil, nil
 			}
@@ -283,27 +347,143 @@ func (s *Service) settle(ctx context.Context, id string) (projection.View, error
 			return &e, err
 		})
 		if err != nil {
-			return projection.View{}, err
+			return o, err
 		}
-		s.log.Info("order rejected", "order_id", id, "reason", rejected.Reason, "request_id", reqid.From(ctx))
+		s.log.Info("order rejected", "order_id", o.ID, "reason", rejected.Reason, "request_id", reqid.From(ctx))
+		return o, nil
 	default:
-		v, _ := s.view(id)
-		return v, err
+		return o, err
 	}
-	return s.view(id)
 }
 
-// releaseStock tells the Product service to put a cancelled order's stock back
-// and records that it did.
+// pay asks the Payment service to charge for an order awaiting payment.
+//
+// Three answers, three different consequences. Approved confirms the order. A
+// decline is final: the order fails and its stock goes back. "Could not tell"
+// changes nothing and returns an error, because the charge may well have gone
+// through: the next attempt asks again, and the Payment service answers with
+// whatever it recorded rather than charging twice.
+func (s *Service) pay(ctx context.Context, o domain.Order) error {
+	charge, err := s.payments.Charge(ctx, o.ID, o.TotalMinor, o.Currency, o.PaymentToken)
+	var declined *paymentclient.DeclinedError
+	switch {
+	case err == nil:
+		o, err = s.mutate(ctx, o.ID, func(o domain.Order) (*domain.Event, error) {
+			if o.Status != domain.StatusAwaitingPayment {
+				return nil, nil
+			}
+			e, err := o.CapturePayment(charge.Reference, s.now())
+			return &e, err
+		})
+		if err != nil {
+			return err
+		}
+		if o.Status != domain.StatusConfirmed {
+			// The order expired while the charge was in flight. Money was taken
+			// for an order that no longer exists; the void owed since expiry
+			// will give it back.
+			s.log.Warn("payment arrived after the order ended; the refund owed will return it",
+				"order_id", o.ID, "status", o.Status, "reference", charge.Reference)
+			return nil
+		}
+		s.log.Info("payment captured; order confirmed", "order_id", o.ID, "reference", charge.Reference, "request_id", reqid.From(ctx))
+		return nil
+	case errors.As(err, &declined):
+		if _, err := s.mutate(ctx, o.ID, func(o domain.Order) (*domain.Event, error) {
+			if o.Status != domain.StatusAwaitingPayment {
+				return nil, nil
+			}
+			e, err := o.DeclinePayment(declined.Code, s.now())
+			return &e, err
+		}); err != nil {
+			return err
+		}
+		s.log.Info("payment declined; order failed", "order_id", o.ID, "code", declined.Code, "request_id", reqid.From(ctx))
+		if err := s.compensate(ctx, o.ID); err != nil {
+			s.log.Warn("stock release deferred to reconciler", "order_id", o.ID, "err", err)
+		}
+		return nil
+	case errors.Is(err, paymentclient.ErrVoided):
+		// Only possible once the order has expired and been voided.
+		return nil
+	default:
+		return err
+	}
+}
+
+// expireIfStale gives up on an order that has waited too long for payment. It
+// reports whether it did.
+func (s *Service) expireIfStale(ctx context.Context, id string) bool {
+	o, err := s.load(ctx, id)
+	if err != nil || o.Status != domain.StatusAwaitingPayment || s.now().Sub(o.UpdatedAt) < s.paymentTTL {
+		return false
+	}
+	// The event is stored first. From that moment the order cannot be
+	// confirmed, and the void that follows closes the window in which a charge
+	// that was already in flight could still land: it either finds the charge
+	// and refunds it, or leaves a tombstone that makes a late charge fail.
+	o, err = s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
+		if o.Status != domain.StatusAwaitingPayment {
+			return nil, nil
+		}
+		e, err := o.Expire(s.now())
+		return &e, err
+	})
+	if err != nil || o.Status != domain.StatusExpired {
+		return false
+	}
+	s.log.Info("order expired unpaid; stock goes back", "order_id", id, "held_for", s.now().Sub(o.PlacedAt).Round(time.Second).String())
+	if err := s.compensate(ctx, id); err != nil {
+		s.log.Warn("compensation deferred to reconciler", "order_id", id, "err", err)
+	}
+	return true
+}
+
+// compensate pays back whatever a finished order still owes: stock to the
+// Product service and a void or refund to the Payment service. The two are
+// independent, so one failing does not hold up the other.
+func (s *Service) compensate(ctx context.Context, id string) error {
+	o, err := s.load(ctx, id)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	if o.ReleasePending {
+		errs = append(errs, s.releaseStock(ctx, id))
+	}
+	if o.RefundPending {
+		errs = append(errs, s.refundPayment(ctx, id))
+	}
+	return errors.Join(errs...)
+}
+
+// releaseStock tells the Product service to put an order's stock back and
+// records that it did.
 func (s *Service) releaseStock(ctx context.Context, id string) error {
 	if err := s.products.Release(ctx, id); err != nil {
-		return err
+		return fmt.Errorf("release stock: %w", err)
 	}
 	_, err := s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
 		if !o.ReleasePending {
 			return nil, nil
 		}
 		e, err := o.MarkStockReleased(s.now())
+		return &e, err
+	})
+	return err
+}
+
+// refundPayment tells the Payment service to void an order's charge and
+// records that it did.
+func (s *Service) refundPayment(ctx context.Context, id string) error {
+	if err := s.payments.Cancel(ctx, id); err != nil {
+		return fmt.Errorf("refund payment: %w", err)
+	}
+	_, err := s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
+		if !o.RefundPending {
+			return nil, nil
+		}
+		e, err := o.MarkPaymentRefunded(s.now())
 		return &e, err
 	})
 	return err

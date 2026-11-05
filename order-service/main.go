@@ -4,11 +4,14 @@
 //
 //	PORT                 listen port                               (default 8081)
 //	PRODUCT_URL          base URL of the Product service           (default http://localhost:8080)
+//	PAYMENT_URL          base URL of the Payment service           (default http://localhost:8082)
+//	PAYMENT_TTL          how long stock is held awaiting payment   (default 15m)
 //	EVENT_STORE          file | cassandra                          (default file)
 //	DATA_DIR             where events.log is kept (file store)     (default ./data)
 //	CASSANDRA_HOSTS      comma-separated contact points            (cassandra store)
 //	CASSANDRA_KEYSPACE   keyspace holding order_events             (default gocart)
 //	RECONCILE_INTERVAL   how often unfinished orders are retried   (default 5s)
+//	ADMIN_KEY    shared secret for admin endpoints   (unset: they refuse everything)
 //	LOG_LEVEL            debug | info | warn | error               (default info)
 //
 // The cassandra store is compiled in only with `-tags cassandra`.
@@ -30,6 +33,7 @@ import (
 
 	"gocart/order-service/internal/eventstore"
 	"gocart/order-service/internal/httpapi"
+	"gocart/order-service/internal/paymentclient"
 	"gocart/order-service/internal/productclient"
 	"gocart/order-service/internal/service"
 )
@@ -65,8 +69,14 @@ func run(log *slog.Logger, port string) error {
 	}
 	defer store.Close()
 
+	ttl, err := time.ParseDuration(env("PAYMENT_TTL", "15m"))
+	if err != nil || ttl < time.Second {
+		return errors.New("PAYMENT_TTL must be a duration of at least 1s, for example 15m")
+	}
+
 	products := productclient.New(env("PRODUCT_URL", "http://localhost:8080"))
-	svc, err := service.New(store, products, log)
+	payments := paymentclient.New(env("PAYMENT_URL", "http://localhost:8082"))
+	svc, err := service.New(store, products, payments, log, service.WithPaymentTTL(ttl))
 	if err != nil {
 		return err
 	}
@@ -77,17 +87,18 @@ func run(log *slog.Logger, port string) error {
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           httpapi.New(svc, log).Handler(),
+		Handler:           httpapi.New(svc, log, apiOptions(log)...).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      20 * time.Second, // placing an order waits on the Product service
+		WriteTimeout:      30 * time.Second, // placing an order waits on the Product and Payment services
 		IdleTimeout:       60 * time.Second,
 	}
 
 	failed := make(chan error, 1)
 	go func() {
 		log.Info("order-service listening", "addr", srv.Addr, "version", version,
-			"event_store", env("EVENT_STORE", "file"), "product_url", env("PRODUCT_URL", "http://localhost:8080"))
+			"event_store", env("EVENT_STORE", "file"), "product_url", env("PRODUCT_URL", "http://localhost:8080"),
+			"payment_url", env("PAYMENT_URL", "http://localhost:8082"), "payment_ttl", ttl.String())
 		failed <- srv.ListenAndServe()
 	}()
 
@@ -122,6 +133,16 @@ func openStore(log *slog.Logger) (eventstore.Store, error) {
 	default:
 		return nil, errors.New(`EVENT_STORE must be "file" or "cassandra", got "` + kind + `"`)
 	}
+}
+
+// apiOptions reads the admin key. Without one the admin endpoints refuse every
+// request, so forgetting to set it fails closed rather than open.
+func apiOptions(log *slog.Logger) []httpapi.Option {
+	key := env("ADMIN_KEY", "")
+	if key == "" {
+		log.Warn("ADMIN_KEY is not set: admin endpoints will refuse every request")
+	}
+	return []httpapi.Option{httpapi.WithAdminKey(key), httpapi.WithVersion(version)}
 }
 
 func probe(port string) int {

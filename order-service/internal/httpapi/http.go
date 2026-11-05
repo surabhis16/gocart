@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"gocart/order-service/internal/domain"
@@ -38,24 +39,50 @@ type route struct {
 
 // Server wires the Order service to HTTP.
 type Server struct {
-	svc    *service.Service
-	log    *slog.Logger
-	routes []route
+	svc      *service.Service
+	log      *slog.Logger
+	routes   []route
+	metrics  *metrics
+	adminKey string
 }
 
 // New builds a Server.
-func New(svc *service.Service, log *slog.Logger) *Server {
-	s := &Server{svc: svc, log: log}
+func New(svc *service.Service, log *slog.Logger, opts ...Option) *Server {
+	s := &Server{svc: svc, log: log, metrics: newMetrics("order-service")}
+	for _, o := range opts {
+		o(s)
+	}
 	s.routes = []route{
 		{"GET /healthz", s.health},
+		{"GET /metrics", s.serveMetrics},
 		{"POST /orders", s.placeOrder},
 		{"GET /orders", s.listOrders},
 		{"GET /orders/{id}", s.getOrder},
-		{"GET /orders/{id}/events", s.orderEvents},
+		{"GET /orders/{id}/events", s.admin(s.orderEvents)},
 		{"POST /orders/{id}/cancel", s.cancelOrder},
-		{"POST /orders/{id}/ship", s.shipOrder},
+		{"POST /orders/{id}/ship", s.admin(s.shipOrder)},
 	}
 	return s
+}
+
+func (s *Server) gauges() []Gauge {
+	var out []Gauge
+	for st, n := range s.svc.Projection().StatusCounts() {
+		out = append(out, Gauge{
+			Name: "gocart_orders", Help: "Orders, by status.",
+			Labels: map[string]string{"status": string(st)}, Value: float64(n),
+		})
+	}
+	// Work the reconciler still has to do. Anything here that keeps growing
+	// means a downstream service has been unavailable for a while.
+	w := s.svc.Projection().Pending(time.Now(), 0)
+	for kind, ids := range map[string][]string{"placed": w.Placed, "awaiting_payment": w.Unpaid, "stock_release": w.Release, "refund": w.Refund} {
+		out = append(out, Gauge{
+			Name: "gocart_orders_pending_work", Help: "Orders that still need the reconciler to finish something, by kind.",
+			Labels: map[string]string{"kind": kind}, Value: float64(len(ids)),
+		})
+	}
+	return out
 }
 
 // Routes lists the "METHOD /path" patterns this server answers.
@@ -71,9 +98,9 @@ func (s *Server) Routes() []string {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, rt := range s.routes {
-		mux.HandleFunc(rt.pattern, rt.handler)
+		mux.HandleFunc(rt.pattern, s.metrics.wrap(rt.pattern, rt.handler))
 	}
-	return requestID(accessLog(s.log, recoverer(s.log, mux)))
+	return requestID(accessLog(s.log, s.metrics.middleware(recoverer(s.log, mux))))
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -82,8 +109,9 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) placeOrder(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		CustomerID string        `json:"customer_id"`
-		Items      []domain.Item `json:"items"`
+		CustomerID   string        `json:"customer_id"`
+		Items        []domain.Item `json:"items"`
+		PaymentToken string        `json:"payment_token"`
 	}
 	if !decode(w, r, &in, false) {
 		return
@@ -96,7 +124,7 @@ func (s *Server) placeOrder(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	res, err := s.svc.Place(r.Context(), in.CustomerID, key, in.Items)
+	res, err := s.svc.Place(r.Context(), in.CustomerID, key, in.PaymentToken, in.Items)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -111,9 +139,23 @@ func (s *Server) placeOrder(w http.ResponseWriter, r *http.Request) {
 			Detail: o.RejectDetail,
 			Extra:  map[string]any{"order_id": o.ID, "reason": o.RejectReason},
 		})
-	case domain.StatusPlaced:
-		// Accepted but not decided: the Product service did not answer. The
-		// order is safe and will be settled automatically.
+	case domain.StatusPaymentFailed:
+		// Definite: the card network said no. The stock is already going back.
+		writeProblem(w, r, Problem{
+			Type: "payment-declined", Title: "Payment declined", Status: http.StatusPaymentRequired,
+			Detail: "The card was declined. The order is recorded as payment_failed and its stock has been released.",
+			Extra:  map[string]any{"order_id": o.ID, "decline_code": o.DeclineCode},
+		})
+	case domain.StatusExpired:
+		// Only seen when an old Idempotency-Key is replayed after the time limit.
+		writeProblem(w, r, Problem{
+			Type: "order-expired", Title: "Order expired", Status: http.StatusConflict,
+			Detail: "Payment was not completed in time, so the order was released.",
+			Extra:  map[string]any{"order_id": o.ID},
+		})
+	case domain.StatusPlaced, domain.StatusAwaitingPayment:
+		// Accepted but not decided: the Product or Payment service did not
+		// answer. The order is safe and will be settled automatically.
 		w.Header().Set("Location", "/orders/"+o.ID)
 		w.Header().Set("Retry-After", "5")
 		writeJSON(w, http.StatusAccepted, o)
@@ -140,16 +182,20 @@ func (s *Server) listOrders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := projection.Filter{CustomerID: q.Get("customer_id")}
 	if st := q.Get("status"); st != "" {
-		switch domain.Status(st) {
-		case domain.StatusPlaced, domain.StatusConfirmed, domain.StatusRejected, domain.StatusCancelled, domain.StatusShipped:
-			f.Status = domain.Status(st)
-		default:
+		valid := false
+		names := make([]string, len(domain.AllStatuses))
+		for i, v := range domain.AllStatuses {
+			names[i] = string(v)
+			valid = valid || string(v) == st
+		}
+		if !valid {
 			writeProblem(w, r, Problem{
 				Type: "validation-failed", Title: "Validation failed", Status: http.StatusUnprocessableEntity,
-				Detail: "status must be one of placed, confirmed, rejected, cancelled, shipped",
+				Detail: "status must be one of " + strings.Join(names, ", "),
 			})
 			return
 		}
+		f.Status = domain.Status(st)
 	}
 	if l := q.Get("limit"); l != "" {
 		n, err := strconv.Atoi(l)
@@ -179,7 +225,7 @@ func (s *Server) orderEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]out, len(events))
 	for i, e := range events {
-		items[i] = out{Version: e.Version, Type: e.Type, At: e.At, Data: e.Data}
+		items[i] = out{Version: e.Version, Type: e.Type, At: e.At, Data: redact(e)}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"order_id": r.PathValue("id"), "events": items})
 }
@@ -254,4 +300,23 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		s.log.Error("unhandled error", "err", err, "request_id", reqid.From(r.Context()))
 		writeProblem(w, r, Problem{Type: "internal", Title: "Internal error", Status: http.StatusInternalServerError})
 	}
+}
+
+// redact removes the payment token from an OrderPlaced payload. The token is
+// stored in the log so a payment can be retried, but nothing that reads the
+// history over HTTP needs it.
+func redact(e domain.Event) json.RawMessage {
+	if e.Type != domain.TypeOrderPlaced {
+		return e.Data
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(e.Data, &m); err != nil {
+		return e.Data
+	}
+	delete(m, "payment_token")
+	b, err := json.Marshal(m)
+	if err != nil {
+		return e.Data
+	}
+	return b
 }

@@ -24,7 +24,7 @@ fi
 esc=${old//./\\.}
 
 printf '%s\n' "$new" > VERSION
-sed -i -E "s#(image: gocart/(product|order)-service:)${esc}\$#\1${new}#" infra/k8s/base/*.yaml
+sed -i -E "s#(image: gocart/(product|order|payment)-service:)${esc}\$#\1${new}#" infra/k8s/base/*.yaml
 sed -i -E "s#(newTag: )${esc}\$#\1${new}#" infra/k8s/overlays/staging/kustomization.yaml
 sed -i -E "s#(newTag: )${esc}-cassandra\$#\1${new}-cassandra#" infra/k8s/overlays/staging-cassandra/kustomization.yaml
 sed -i -E "s#\\\$\{VERSION:-${esc}\}#\${VERSION:-${new}}#g" docker-compose.yml docker-compose.cassandra.yml

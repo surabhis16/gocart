@@ -1,6 +1,7 @@
 flowchart TB
     cust([Customer])
     admin([Admin])
+    card[[Card network<br/>mock provider]]
 
     subgraph order_ctx [Order bounded context]
         direction TB
@@ -22,7 +23,16 @@ flowchart TB
         papi --> cat
     end
 
+    subgraph payment_ctx [Payment bounded context]
+        direction TB
+        payapi[HTTP API]
+        led[(Charge ledger<br/>ledger.json)]
+        payapi --> led
+    end
+
     cust -->|place, cancel, look up| oapi
-    admin -->|ship| oapi
+    admin -->|ship, read the log| oapi
     admin -->|add products, restock| papi
     osvc ==>|reserve / release,<br/>retried safely| papi
+    osvc ==>|charge / void,<br/>retried safely| payapi
+    led -->|authorize| card

@@ -4,12 +4,17 @@ sequenceDiagram
     participant O as Order service
     participant L as Event log
     participant P as Product service
+    participant Y as Payment service
 
-    C->>O: POST /orders  (Idempotency-Key)
-    Note over O: validate the request
+    C->>O: POST /orders  (Idempotency-Key, payment_token)
+    Note over O: validate; refuse anything<br/>that is not a tok_... token
     O->>L: append OrderPlaced (v1)
     O->>P: POST /reservations  (order id, items)
     Note over P: all lines or none,<br/>idempotent per order id
     P-->>O: 201 reserved, with names and prices
-    O->>L: append OrderConfirmed (v2)
+    O->>L: append StockReserved (v2), total worked out
+    O->>Y: POST /charges  (order id, total, token)
+    Note over Y: one charge per order id,<br/>asking twice never charges twice
+    Y-->>O: 201 approved, reference
+    O->>L: append PaymentCaptured (v3)
     O-->>C: 201 Created, status confirmed

@@ -26,11 +26,24 @@ func newTestServer(t *testing.T) (*Server, http.Handler) {
 	if _, err := store.SeedIfEmpty(); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(store, slog.New(slog.NewTextHandler(io.Discard, nil)), WithAdminKey(testKey))
 	return srv, srv.Handler()
 }
 
+const testKey = "test-admin-key"
+
+// do sends a request carrying the admin key; doAnon sends it without one.
 func do(t *testing.T, h http.Handler, method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doAs(t, h, method, path, body, append([]string{"Authorization", "Bearer " + testKey}, hdr...)...)
+}
+
+func doAnon(t *testing.T, h http.Handler, method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doAs(t, h, method, path, body, hdr...)
+}
+
+func doAs(t *testing.T, h http.Handler, method, path, body string, hdr ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	for i := 0; i+1 < len(hdr); i += 2 {

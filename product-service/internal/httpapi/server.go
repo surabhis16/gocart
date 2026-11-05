@@ -22,24 +22,46 @@ type route struct {
 
 // Server wires the catalogue to HTTP.
 type Server struct {
-	store  *catalog.Store
-	log    *slog.Logger
-	routes []route
+	store    *catalog.Store
+	log      *slog.Logger
+	routes   []route
+	metrics  *metrics
+	adminKey string
 }
 
 // New builds a Server.
-func New(store *catalog.Store, log *slog.Logger) *Server {
-	s := &Server{store: store, log: log}
+func New(store *catalog.Store, log *slog.Logger, opts ...Option) *Server {
+	s := &Server{store: store, log: log, metrics: newMetrics("product-service")}
+	for _, o := range opts {
+		o(s)
+	}
 	s.routes = []route{
 		{"GET /healthz", s.health},
+		{"GET /metrics", s.serveMetrics},
 		{"GET /products", s.listProducts},
-		{"POST /products", s.createProduct},
+		{"POST /products", s.admin(s.createProduct)},
 		{"GET /products/{id}", s.getProduct},
-		{"PUT /products/{id}/stock", s.setStock},
+		{"PUT /products/{id}/stock", s.admin(s.setStock)},
 		{"POST /reservations", s.reserve},
 		{"DELETE /reservations/{order_id}", s.release},
 	}
 	return s
+}
+
+func (s *Server) gauges() []Gauge {
+	var products, outOfStock, units int
+	for _, p := range s.store.List() {
+		products++
+		units += p.Stock
+		if p.Stock == 0 {
+			outOfStock++
+		}
+	}
+	return []Gauge{
+		{Name: "gocart_products", Help: "Products in the catalogue.", Value: float64(products)},
+		{Name: "gocart_products_out_of_stock", Help: "Products with no stock left.", Value: float64(outOfStock)},
+		{Name: "gocart_stock_units", Help: "Units in stock across all products.", Value: float64(units)},
+	}
 }
 
 // Routes lists the "METHOD /path" patterns this server answers.
@@ -55,9 +77,9 @@ func (s *Server) Routes() []string {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, rt := range s.routes {
-		mux.HandleFunc(rt.pattern, rt.handler)
+		mux.HandleFunc(rt.pattern, s.metrics.wrap(rt.pattern, rt.handler))
 	}
-	return requestID(accessLog(s.log, recoverer(s.log, mux)))
+	return requestID(accessLog(s.log, s.metrics.middleware(recoverer(s.log, mux))))
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
