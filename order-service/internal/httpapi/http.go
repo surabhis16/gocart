@@ -61,6 +61,7 @@ func New(svc *service.Service, log *slog.Logger, opts ...Option) *Server {
 		{"GET /orders/{id}/events", s.admin(s.orderEvents)},
 		{"POST /orders/{id}/cancel", s.cancelOrder},
 		{"POST /orders/{id}/ship", s.admin(s.shipOrder)},
+		{"POST /orders/{id}/deliver", s.admin(s.deliverOrder)},
 	}
 	return s
 }
@@ -170,9 +171,12 @@ func (s *Server) placeOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
-	v, ok := s.svc.Projection().Get(r.PathValue("id"))
-	if !ok {
-		writeProblem(w, r, Problem{Type: "not-found", Title: "Order not found", Status: http.StatusNotFound})
+	// Served from the read model; if it has never heard of the id, the service
+	// checks the store, since another replica may have created the order a
+	// moment ago.
+	v, err := s.svc.Order(r.PathValue("id"))
+	if err != nil {
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, v)
@@ -247,6 +251,15 @@ func (s *Server) cancelOrder(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) shipOrder(w http.ResponseWriter, r *http.Request) {
 	v, err := s.svc.Ship(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) deliverOrder(w http.ResponseWriter, r *http.Request) {
+	v, err := s.svc.Deliver(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.fail(w, r, err)
 		return

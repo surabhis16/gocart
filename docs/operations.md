@@ -19,7 +19,7 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 docker compose up --build
 ```
 
-Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>. The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
+Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>, Cart on <http://localhost:8083>. The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
 
 ```
 curl -s localhost:8080/products | python3 -m json.tool
@@ -41,7 +41,7 @@ You will see `OrderPlaced`, `StockReserved`, `PaymentCaptured`. The payment toke
 
 Three scripts exercise it end to end (use a fresh stack for `smoke.sh`: `docker compose down -v`):
 
-- `./scripts/smoke.sh`: 48 checks across all three services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, admin endpoints refused without the key, metrics present.
+- `./scripts/smoke.sh`: 71 checks across all four services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), shipped then delivered, admin endpoints refused without the key, metrics present.
 - `./scripts/oversell-demo.sh`: 20 customers each click "buy" twice at the same instant, for 3 lamps. It checks that exactly 3 orders were confirmed, stock ended at 0, exactly 3 charges were taken and no double-click was charged twice. It sets the stock itself, so it can be re-run.
 - `./scripts/outage-demo.sh`: two acts. The Product service goes down mid-order, then the Payment service does; each time the order is accepted (`202`), and finishes by itself when the service returns, with stock reserved once and money taken once.
 
@@ -52,6 +52,7 @@ export ADMIN_KEY=dev-admin-key
 (cd product-service && go run .)                       # :8080
 (cd payment-service && go run .)                       # :8082
 (cd order-service   && go run .)                       # :8081
+(cd cart-service    && go run .)                       # :8083
 ```
 
 Data goes to `./data` in each directory. Configuration is by environment variable; the full list is at the top of each `main.go`.
@@ -62,13 +63,13 @@ Data goes to `./data` in each directory. Configuration is by environment variabl
 make test
 ```
 
-Format check, `go vet` and the race detector for all three services: 164 tests (211 counting subtests). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
+Format check, `go vet` and the race detector for all four services: 213 tests (262 counting subtests). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
 
 ## Developer workspace (Unit IV)
 
 **Coding standards** are enforced by the machine instead of by review comments: CI fails on anything `gofmt` would change, on `go vet` findings, and on any data race (`go test -race`). Each service is a standard Go layout: `main.go` for wiring, `internal/` for everything else, so nothing outside a service can import its internals.
 
-**A containerised environment locally** is `docker-compose.yml`. Each of the three Dockerfiles is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
+**A containerised environment locally** is `docker-compose.yml`. Each of the four Dockerfiles is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
 
 ### Cassandra
 
@@ -112,7 +113,7 @@ kubectl -n gocart-local get pods
 
 The manifests make a few choices on purpose; each is commented in the YAML:
 
-- **One replica each, with a `Recreate` rollout.** State is a file with one writer; see the [limits table](architecture.md#known-limits).
+- **One replica each, with a `Recreate` rollout.** State is a file with one writer; see the [limits table](architecture.md#known-limits). The exception is `staging-cassandra`, which runs **two Order replicas** with a `RollingUpdate` (no volume, nothing on disk to protect). They stay consistent through the change feed; tune it with `SYNC_INTERVAL` (default 2s) and `RESYNC_INTERVAL` (default 5m). To see it: `kubectl -n gocart-staging get pods -l app.kubernetes.io/name=order-service`, place orders, and read them back repeatedly: both replicas answer, and `GET /orders/{id}` is always right.
 - **The Order service's readiness probe checks neither the Product nor the Payment service.** If it did, an outage of either would take Order out of rotation, and the whole design is that Order keeps accepting orders during one.
 - **The admin key comes from a Secret**, never from a literal in a Deployment. The `local` and `staging` overlays generate it from a demo value; see [Admin key](#admin-key-and-metrics).
 - **Hardened pods:** non-root, read-only root filesystem, all capabilities dropped, default seccomp profile, resource limits.
@@ -131,11 +132,11 @@ The manifests make a few choices on purpose; each is commented in the YAML:
 | The pipeline is the only path to a release | tag `v*` triggers `release.yml` |
 | Small, frequent, reversible changes | one `VERSION`, one-command bump (`scripts/bump-version.sh`), idempotent operations |
 | Environments are reproducible | `docker compose up`, `kubectl apply -k` |
-| Know when it is broken | structured JSON logs, a request ID across all three services, a Prometheus `/metrics` endpoint on each, health endpoints |
+| Know when it is broken | structured JSON logs, a request ID across all four services, a Prometheus `/metrics` endpoint on each, health endpoints |
 
 ### Terraform
 
-`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) for each of the three services, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
+`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) for each of the four services, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
 
 There is deliberately **no VPC, load balancer or cluster**. Those are the expensive parts of AWS, and this project runs on a laptop. The practice, which is what Unit III teaches, is infrastructure described in files, reviewed, planned, and applied by a pipeline.
 
@@ -167,7 +168,7 @@ By my count the plan should show 10 resources to add: 3 repositories, 3 lifecycl
 | `test` | per service: `gofmt`, `go vet`, `go test -race` (including the OpenAPI drift test) |
 | `cassandra-event-store` | compiles the Cassandra store and runs the shared contract suite against a live Cassandra |
 | `infrastructure` | `terraform fmt/validate/plan`, the Kubernetes check, both compose files |
-| `end-to-end` | builds the three images, starts the stack, runs `smoke.sh`, the oversell demo, then the outage demo |
+| `end-to-end` | builds the four images, starts the stack, runs `smoke.sh`, the oversell demo, then the outage demo |
 
 ## Releasing (Unit V)
 
@@ -182,13 +183,13 @@ This is the whole path from source to a running staging environment:
 1. confirms the manifests agree on the version in `VERSION`;
 2. enables minikube's `registry` addon, a registry running inside the cluster;
 3. opens it on `localhost:5000` on your machine;
-4. builds the three images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
+4. builds the four images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
 5. applies the `staging` overlay into the `gocart-staging` namespace, which makes the cluster pull the *same name* from its own registry;
 6. waits for each rollout, then prints how to reach it.
 
 Then `./scripts/smoke.sh` against the forwarded ports, or the outage demo using `kubectl scale` as the way to take Product and Payment away (the exact commands are printed).
 
-For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build all three images and publish them to GitHub's free container registry, `ghcr.io`.
+For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build all four images and publish them to GitHub's free container registry, `ghcr.io`.
 
 `scripts/bump-version.sh 0.2.0` changes the version everywhere it is written (the `VERSION` file, the manifests, the compose defaults) and re-runs the consistency check. Left to hand edits, those drift apart and staging quietly runs a different image than the one you just shipped. I tested it by bumping up, bumping back, and confirming the tree is byte-identical to where it started.
 
@@ -285,7 +286,7 @@ And two that matter specifically for *this* architecture, because reducing coord
 - **Cross-team changes per release:** how many releases needed more than one team to change something. It should trend towards zero, and a service whose changes always drag another service along is the sign of a boundary in the wrong place.
 - **Splits and merges:** per the sizing formula, a healthy system keeps splitting where coordination hurts. Track *why* each boundary moved.
 
-A team that ships twice a day to three services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
+A team that ships twice a day to four services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
 
 ## Complexity and simplification
 

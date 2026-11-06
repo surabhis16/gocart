@@ -10,11 +10,11 @@ name: gocart
 # It is a demo default; a real deployment injects a secret, never a literal.
 x-admin: &admin-key ${ADMIN_KEY:-dev-admin-key}
 
-x-version: &version ${VERSION:-0.2.0}
+x-version: &version ${VERSION:-0.3.0}
 
 services:
   product-service:
-    image: gocart/product-service:${VERSION:-0.2.0}
+    image: gocart/product-service:${VERSION:-0.3.0}
     build:
       context: ./product-service
       args:
@@ -29,7 +29,7 @@ services:
     # Each service owns its data: there is no database both can reach.
 
   order-service:
-    image: gocart/order-service:${VERSION:-0.2.0}
+    image: gocart/order-service:${VERSION:-0.3.0}
     build:
       context: ./order-service
       args:
@@ -51,8 +51,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  cart-service:
+    image: gocart/cart-service:${VERSION:-0.3.0}
+    build:
+      context: ./cart-service
+      args:
+        VERSION: *version
+    environment:
+      PRODUCT_URL: http://product-service:8080
+      ORDER_URL: http://order-service:8081
+    ports:
+      - "8083:8083"
+    volumes:
+      - cart-data:/data
+    depends_on:
+      product-service:
+        condition: service_healthy # start-up order only; carts still work, then fail clearly, if either goes away
+      order-service:
+        condition: service_healthy
+    restart: unless-stopped
+
   payment-service:
-    image: gocart/payment-service:${VERSION:-0.2.0}
+    image: gocart/payment-service:${VERSION:-0.3.0}
     build:
       context: ./payment-service
       args:
@@ -70,3 +90,4 @@ volumes:
   product-data:
   order-data:
   payment-data:
+  cart-data:

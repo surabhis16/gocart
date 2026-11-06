@@ -1,0 +1,369 @@
+openapi: 3.0.3
+info:
+  title: GoCart Cart Service
+  version: 0.3.0
+  description: |
+    The Cart bounded context: what a customer intends to buy, and the checkout
+    that turns it into an order.
+
+    **A cart holds no prices.** Prices belong to the Product service, and a copy
+    kept here would go stale and then disagree with what the Order service
+    charges. The cart says what you want; the order says what it costs.
+
+    **Every change to a cart moves its `revision`.** Checkout sends the Order
+    service an `Idempotency-Key` built from the customer and the revision, so
+    the same cart in the same state always means the same order.
+
+    **Checkout is safe to retry.**
+
+    | What happened | The cart afterwards | Retrying |
+    |---|---|---|
+    | The Order service did not answer (`503`) | unchanged | sends the same key, so it finds the order if one was made |
+    | An order exists (`201`, `200`, `202`) | marked with `order_id`; lines kept | replays the same order (`200`) |
+    | The order was refused (`402`, `409`) | unchanged, but on a new revision | makes a fresh attempt; the old key would replay the refusal |
+
+    A checked-out cart keeps the lines that were bought. The next change to it
+    (adding, removing, clearing) starts a fresh cart.
+
+    **There are no customer logins yet.** The customer id is in the path and
+    nothing checks who is asking, exactly as with orders. It is limited to
+    `A-Z a-z 0-9 . _ -`, 1-64 characters.
+
+    **Errors** are RFC 9457 problem documents (`application/problem+json`) whose
+    `type` is a URN, listed under `Problem`.
+servers:
+  - url: http://localhost:8083
+    description: Local (docker compose or `go run`)
+tags:
+  - name: cart
+    description: Build a cart.
+  - name: checkout
+    description: Turn a cart into an order.
+  - name: ops
+    description: Operational endpoints.
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Request counts and latency by route pattern, plus `gocart_carts` by
+        state. Plain text in the Prometheus exposition format. Not
+        authenticated: it holds counts only.
+      responses:
+        "200":
+          description: Metrics in the Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /carts/{customer_id}:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    get:
+      tags: [cart]
+      operationId: getCart
+      summary: Get a customer's cart
+      description: A customer with no cart has an empty one, at revision 0.
+      responses:
+        "200":
+          description: The cart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      tags: [cart]
+      operationId: clearCart
+      summary: Empty the cart
+      description: Idempotent. Clearing an empty cart succeeds and changes nothing.
+      responses:
+        "204":
+          description: The cart is empty.
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /carts/{customer_id}/items/{product_id}:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+      - name: product_id
+        in: path
+        required: true
+        schema:
+          type: string
+          example: prd_lamp
+    put:
+      tags: [cart]
+      operationId: setItem
+      summary: Set how many of a product the customer wants
+      description: |
+        States the quantity wanted rather than adding to it, so sending it twice
+        leaves the cart as it was after the first. A product being added for
+        the first time is checked against the Product service; one already in
+        the cart is not, so quantities can still change while the Product
+        service is down.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetItem"
+      responses:
+        "200":
+          description: The cart after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "422":
+          description: |
+            `validation-failed` (quantity out of range, more than 50 products)
+            or `unknown-product`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            `product-service-unavailable`. Nothing changed; safe to retry.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 2
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      tags: [cart]
+      operationId: removeItem
+      summary: Take a product out of the cart
+      description: Idempotent. Removing a product that is not there succeeds.
+      responses:
+        "200":
+          description: The cart after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /carts/{customer_id}/checkout:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    post:
+      tags: [checkout]
+      operationId: checkout
+      summary: Turn the cart into an order
+      description: |
+        Places an order for the cart's lines and returns the **Order service's
+        own answer, unchanged**: the order on success, or its problem document
+        on refusal (see `docs/openapi/order.yaml`, `POST /orders`).
+
+        Safe to repeat; see the table at the top of this document.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckoutRequest"
+      responses:
+        "201":
+          description: The order was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PassedThroughOrder"
+        "200":
+          description: This cart was already checked out; the same order is returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PassedThroughOrder"
+        "202":
+          description: |
+            The order exists but is not decided yet, because the Product or
+            Payment service did not answer. It settles by itself.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PassedThroughOrder"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "402":
+          description: |
+            `payment-declined`, from the Order service. Definite. The cart is
+            kept, so the customer can try another card.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            `cart-empty`, or `order-rejected` from the Order service (for
+            example, not enough stock). The cart is kept.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "503":
+          description: |
+            `checkout-unavailable`. The Order service did not answer, so it is
+            not known whether an order was made. The cart is unchanged;
+            repeating the request cannot create a second order.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 2
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+components:
+  parameters:
+    CustomerId:
+      name: customer_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._-]{1,64}$"
+        example: cust_ada
+  responses:
+    MalformedBody:
+      description: The body is not valid JSON, has unknown fields, or has trailing data.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    TooLarge:
+      description: The body is larger than 1 MiB.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationFailed:
+      description: The request was understood but breaks a rule. `detail` says which.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Cart:
+      type: object
+      required: [customer_id, items, revision]
+      properties:
+        customer_id:
+          type: string
+        items:
+          type: array
+          description: Sorted by product id.
+          items:
+            $ref: "#/components/schemas/Line"
+        revision:
+          type: integer
+          format: int64
+          description: Changes whenever the contents do. Checkout's Idempotency-Key is built from it.
+        order_id:
+          type: string
+          description: Present once the cart has been checked out.
+          example: ord_9f2c41d0a7b35e68
+        updated_at:
+          type: string
+          format: date-time
+    Line:
+      type: object
+      required: [product_id, name, quantity]
+      properties:
+        product_id:
+          type: string
+          example: prd_lamp
+        name:
+          type: string
+          description: Copied from the Product service when the line was added, so the cart can be shown without calling it. Never a price.
+          example: Desk lamp
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+    SetItem:
+      type: object
+      required: [quantity]
+      additionalProperties: false
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 2
+    CheckoutRequest:
+      type: object
+      required: [payment_token]
+      additionalProperties: false
+      properties:
+        payment_token:
+          type: string
+          pattern: "^tok_[a-z0-9_]{1,40}$"
+          description: A provider token such as `tok_visa`. See the Payment service for the test tokens.
+          example: tok_visa
+    PassedThroughOrder:
+      type: object
+      description: |
+        The Order service's `Order` document, unchanged. It is not redefined
+        here, so this contract cannot drift from the Order service's.
+      required: [id]
+      properties:
+        id:
+          type: string
+          example: ord_9f2c41d0a7b35e68
+      additionalProperties: true
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem details. `type` is `urn:gocart:problem:` followed by one
+        of `invalid-request`, `validation-failed`, `unknown-product`,
+        `product-service-unavailable`, `cart-empty`, `checkout-unavailable`,
+        `payload-too-large` or `internal`. A refusal passed through from the Order
+        service keeps that service's types (`payment-declined`, `order-rejected`,
+        and so on).
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          example: urn:gocart:problem:cart-empty
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        request_id:
+          type: string
+      additionalProperties: true

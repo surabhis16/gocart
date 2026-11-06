@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant K as Cart service
+    participant O as Order service
+
+    C->>K: POST /carts/ada/checkout  (tok_visa)
+    Note over K: cart is at revision 4,<br/>key = cart:ada:4
+    K->>O: POST /orders  (Idempotency-Key cart:ada:4)
+    O--xK: the answer is lost (timeout)
+    K-->>C: 503 checkout-unavailable, cart unchanged
+    Note over C,K: the order may exist. Nobody knows.
+    C->>K: POST /carts/ada/checkout  (same request)
+    K->>O: POST /orders  (same key, cart:ada:4)
+    Note over O: key seen before:<br/>return that order, make no new one
+    O-->>K: 200 the existing order
+    K-->>C: 200 the same order, cart marked ordered
+    Note over C,K: a declined card (402) is different: the cart moves to<br/>revision 5, so the next try sends a new key

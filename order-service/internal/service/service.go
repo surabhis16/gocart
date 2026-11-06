@@ -83,6 +83,12 @@ type Service struct {
 	paymentTTL time.Duration
 
 	commitMu sync.Mutex // keeps "append" and "update the view" in the same order
+
+	// Syncing with other replicas: see sync.go.
+	syncMu      sync.Mutex
+	lastSync    time.Time
+	lastFull    time.Time
+	resyncEvery time.Duration
 }
 
 // Option configures a Service.
@@ -102,10 +108,15 @@ func New(store eventstore.Store, products Products, payments Payments, log *slog
 	s := &Service{
 		store: store, proj: projection.New(), products: products, payments: payments, log: log,
 		now: time.Now, grace: 10 * time.Second, paymentTTL: 15 * time.Minute,
+		resyncEvery: 5 * time.Minute,
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	// Taken before the load, so anything appended while loading is picked up by
+	// the first Sync rather than falling between the two.
+	s.lastSync = time.Now()
+	s.lastFull = s.lastSync
 	events, err := store.LoadAll(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("load event log: %w", err)
@@ -116,6 +127,13 @@ func New(store eventstore.Store, products Products, payments Payments, log *slog
 	log.Info("read model rebuilt from event log", "events", len(events), "orders", s.proj.Len())
 	return s, nil
 }
+
+// Order returns one order from the read model. Unlike List, which is served
+// from this replica's view and can trail other replicas by a sync interval,
+// Order looks in the store when the view has never heard of the id, because the
+// usual reason is a customer polling the Location of an order that another
+// replica has just created.
+func (s *Service) Order(id string) (projection.View, error) { return s.view(id) }
 
 // Projection exposes the read model to the query side.
 func (s *Service) Projection() *projection.Projection { return s.proj }
@@ -183,14 +201,14 @@ func (s *Service) replay(ctx context.Context, id string, existing []domain.Event
 	}
 	// Give an order that is still unfinished another chance, since the
 	// customer is retrying precisely because they did not get an answer.
-	if v, ok := s.proj.Get(id); ok && (v.Status == domain.StatusPlaced || v.Status == domain.StatusAwaitingPayment) {
+	if v, err := s.view(id); err == nil && (v.Status == domain.StatusPlaced || v.Status == domain.StatusAwaitingPayment) {
 		if view, err := s.settle(ctx, id); err == nil {
 			return PlaceResult{Order: view, Replayed: true}, nil
 		}
 	}
-	view, ok := s.proj.Get(id)
-	if !ok {
-		return PlaceResult{}, ErrNotFound
+	view, err := s.view(id)
+	if err != nil {
+		return PlaceResult{}, err
 	}
 	return PlaceResult{Order: view, Replayed: true}, nil
 }
@@ -215,6 +233,17 @@ func (s *Service) Cancel(ctx context.Context, id, reason string) (projection.Vie
 func (s *Service) Ship(ctx context.Context, id string) (projection.View, error) {
 	if _, err := s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
 		e, err := o.Ship(s.now())
+		return &e, err
+	}); err != nil {
+		return projection.View{}, err
+	}
+	return s.view(id)
+}
+
+// Deliver marks a shipped order as delivered.
+func (s *Service) Deliver(ctx context.Context, id string) (projection.View, error) {
+	if _, err := s.mutate(ctx, id, func(o domain.Order) (*domain.Event, error) {
+		e, err := o.Deliver(s.now())
 		return &e, err
 	}); err != nil {
 		return projection.View{}, err
@@ -539,20 +568,34 @@ func (s *Service) commit(ctx context.Context, e domain.Event) error {
 		return err
 	}
 	if err := s.proj.Apply(e); err != nil {
-		// The event is stored, so the command succeeded. The view is stale
-		// until restart, which rebuilds it; make that loud.
-		s.log.Error("read model could not apply a stored event; it will be rebuilt on restart",
-			"order_id", e.StreamID, "version", e.Version, "err", err)
+		// The event is stored, so the command succeeded. The usual reason the
+		// view cannot apply it is that another replica wrote the order's
+		// earlier events and this one has not heard yet. Load the order's
+		// history and catch up on the spot.
+		if cerr := s.catchUpLocked(ctx, e.StreamID); cerr != nil {
+			s.log.Error("read model could not apply a stored event; the next sync will retry",
+				"order_id", e.StreamID, "version", e.Version, "err", err, "catch_up_err", cerr)
+		}
 	}
 	return nil
 }
 
+// view returns an order from the read model. If the view has never heard of it,
+// another replica may have created it a moment ago, so look in the store before
+// saying it does not exist.
 func (s *Service) view(id string) (projection.View, error) {
-	v, ok := s.proj.Get(id)
-	if !ok {
-		return projection.View{}, ErrNotFound
+	if v, ok := s.proj.Get(id); ok {
+		return v, nil
 	}
-	return v, nil
+	s.commitMu.Lock()
+	err := s.catchUpLocked(context.Background(), id)
+	s.commitMu.Unlock()
+	if err == nil {
+		if v, ok := s.proj.Get(id); ok {
+			return v, nil
+		}
+	}
+	return projection.View{}, ErrNotFound
 }
 
 func newOrderID() string {

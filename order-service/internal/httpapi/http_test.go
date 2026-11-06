@@ -382,6 +382,15 @@ func TestCancelAndShipLifecycle(t *testing.T) {
 		t.Errorf("ship: %d %s", rec.Code, rec.Body)
 	}
 	wantProblem(t, f.do(t, "POST", "/orders/"+other+"/cancel", ""), 409, "invalid-state")
+
+	// Delivery: only a shipped order, once, and then it is final.
+	wantProblem(t, f.do(t, "POST", "/orders/"+id+"/deliver", ""), 409, "invalid-state")
+	wantProblem(t, f.do(t, "POST", "/orders/ord_nope/deliver", ""), 404, "not-found")
+	if rec := f.do(t, "POST", "/orders/"+other+"/deliver", ""); rec.Code != 200 || asMap(t, rec)["status"] != "delivered" {
+		t.Errorf("deliver: %d %s", rec.Code, rec.Body)
+	}
+	wantProblem(t, f.do(t, "POST", "/orders/"+other+"/deliver", ""), 409, "invalid-state")
+	wantProblem(t, f.do(t, "POST", "/orders/"+other+"/cancel", ""), 409, "invalid-state")
 }
 
 func TestCancelReportsThePendingRefund(t *testing.T) {

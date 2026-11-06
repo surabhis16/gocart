@@ -7,7 +7,7 @@ resources:
 images:
   # The Cassandra-enabled build is a different binary, so it is a different tag.
   - name: localhost:5000/gocart/order-service
-    newTag: 0.2.0-cassandra
+    newTag: 0.3.0-cassandra
 patches:
   - target:
       kind: Deployment
@@ -22,3 +22,21 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value: { name: CASSANDRA_KEYSPACE, value: gocart }
+  # With the log in Cassandra there is nothing on local disk to protect, so the
+  # one-writer-at-a-time rules of the file store no longer apply: run two
+  # replicas, roll them without downtime, and drop the volume they no longer use.
+  # (The order-data claim stays defined by the base; nothing mounts it here.)
+  - target:
+      kind: Deployment
+      name: order-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: replace
+        path: /spec/strategy
+        value: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+      - op: remove
+        path: /spec/template/spec/containers/0/volumeMounts
+      - op: remove
+        path: /spec/template/spec/volumes

@@ -116,6 +116,36 @@ func runContract(t *testing.T, open func(t *testing.T) Store) {
 		}
 	})
 
+	t.Run("changed since names recently appended streams", func(t *testing.T) {
+		s := open(t)
+		before := time.Now().Add(-time.Minute)
+		if got, err := s.ChangedSince(ctx, before); err != nil || len(got) != 0 {
+			t.Fatalf("empty store: %v, err %v", got, err)
+		}
+		_ = s.Append(ctx, ev("ord_c1", 1))
+		_ = s.Append(ctx, ev("ord_c2", 1))
+		_ = s.Append(ctx, ev("ord_c1", 2))
+		got, err := s.ChangedSince(ctx, before)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[string]bool{}
+		for _, id := range got {
+			seen[id] = true
+		}
+		if !seen["ord_c1"] || !seen["ord_c2"] {
+			t.Errorf("ChangedSince = %v, want both ord_c1 and ord_c2", got)
+		}
+		// Duplicates are allowed (one entry per append is fine); a stream that
+		// never changed must not appear.
+		if seen["ord_never"] {
+			t.Error("named a stream that was never written")
+		}
+		if later, _ := s.ChangedSince(ctx, time.Now().Add(time.Minute)); len(later) != 0 {
+			t.Errorf("nothing changed in the future, got %v", later)
+		}
+	})
+
 	t.Run("cancelled context is respected", func(t *testing.T) {
 		s := open(t)
 		c, cancel := context.WithCancel(ctx)

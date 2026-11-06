@@ -8,7 +8,7 @@
 //
 // Life cycle:
 //
-//	placed ──► awaiting_payment ──► confirmed ──► shipped
+//	placed ──► awaiting_payment ──► confirmed ──► shipped ──► delivered
 //	   │              │    │             │
 //	   │              │    │             └──► cancelled
 //	   │              │    └──► expired
@@ -75,12 +75,13 @@ const (
 	StatusExpired         Status = "expired"          // nobody paid in time; the stock goes back
 	StatusCancelled       Status = "cancelled"
 	StatusShipped         Status = "shipped"
+	StatusDelivered       Status = "delivered" // reached the customer; the end of the line
 )
 
 // AllStatuses lists every status, for validating filters.
 var AllStatuses = []Status{
 	StatusPlaced, StatusAwaitingPayment, StatusConfirmed, StatusRejected,
-	StatusPaymentFailed, StatusExpired, StatusCancelled, StatusShipped,
+	StatusPaymentFailed, StatusExpired, StatusCancelled, StatusShipped, StatusDelivered,
 }
 
 // Event types. Names are past tense: they record facts, not intentions.
@@ -95,6 +96,7 @@ const (
 	TypeStockReleased      = "StockReleased"
 	TypePaymentRefunded    = "PaymentRefunded"
 	TypeOrderShipped       = "OrderShipped"
+	TypeOrderDelivered     = "OrderDelivered"
 
 	// TypeOrderConfirmed is the version 0.1 way of confirming an order, written
 	// when there was no payment step: stock reserved, done. New code never
@@ -167,6 +169,7 @@ type (
 	StockReleased   struct{}
 	PaymentRefunded struct{}
 	OrderShipped    struct{}
+	OrderDelivered  struct{}
 )
 
 // Order is the aggregate: the state obtained by replaying an order's events.
@@ -329,6 +332,12 @@ func (o *Order) Apply(e Event) error {
 		}
 		o.Status = StatusShipped
 
+	case TypeOrderDelivered:
+		if err := need(StatusShipped); err != nil {
+			return err
+		}
+		o.Status = StatusDelivered
+
 	default:
 		// An unknown type means the log was written by a newer version of this
 		// service. Skipping it silently would produce wrong state.
@@ -455,6 +464,17 @@ func (o Order) Ship(now time.Time) (Event, error) {
 		return Event{}, badTransition("order %s is %s; only a confirmed order can be shipped", o.ID, o.Status)
 	}
 	return o.next(TypeOrderShipped, OrderShipped{}, now), nil
+}
+
+// Deliver records that a shipped order reached the customer. It is the last
+// event an order can have: a delivered order can no longer be cancelled, which
+// is why returns, if they were ever added, would be a new process rather than
+// a late cancellation.
+func (o Order) Deliver(now time.Time) (Event, error) {
+	if o.Status != StatusShipped {
+		return Event{}, badTransition("order %s is %s; only a shipped order can be delivered", o.ID, o.Status)
+	}
+	return o.next(TypeOrderDelivered, OrderDelivered{}, now), nil
 }
 
 func (o Order) next(typ string, payload any, now time.Time) Event {

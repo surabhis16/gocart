@@ -46,6 +46,8 @@ func command(o Order, name string) (Event, error) {
 		return o.MarkPaymentRefunded(t0)
 	case "ship":
 		return o.Ship(t0)
+	case "deliver":
+		return o.Deliver(t0)
 	}
 	panic("unknown command " + name)
 }
@@ -151,7 +153,7 @@ func TestRejectedKeepsItsReason(t *testing.T) {
 // TestTransitionMatrix is the whole state machine in one table: for every
 // state an order can be in, which commands are allowed.
 func TestTransitionMatrix(t *testing.T) {
-	cmds := []string{"reserve", "reject", "capture", "decline", "expire", "cancel", "release", "refund", "ship"}
+	cmds := []string{"reserve", "reject", "capture", "decline", "expire", "cancel", "release", "refund", "ship", "deliver"}
 	states := []struct {
 		name  string
 		steps []string
@@ -169,7 +171,8 @@ func TestTransitionMatrix(t *testing.T) {
 		{"expired, all settled", []string{"reserve", "expire", "release", "refund"}, nil},
 		{"cancelled, both owed", []string{"reserve", "capture", "cancel"}, []string{"release", "refund"}},
 		{"cancelled, all settled", []string{"reserve", "capture", "cancel", "release", "refund"}, nil},
-		{"shipped", []string{"reserve", "capture", "ship"}, nil},
+		{"shipped", []string{"reserve", "capture", "ship"}, []string{"deliver"}},
+		{"delivered", []string{"reserve", "capture", "ship", "deliver"}, nil},
 	}
 	for _, st := range states {
 		allowed := map[string]bool{}
@@ -184,6 +187,21 @@ func TestTransitionMatrix(t *testing.T) {
 			case !allowed[c] && !errors.Is(err, ErrInvalidTransition):
 				t.Errorf("%s: %s err = %v, want ErrInvalidTransition", st.name, c, err)
 			}
+		}
+	}
+}
+
+func TestDeliveredIsTheEndOfTheLine(t *testing.T) {
+	o := build(t, "reserve", "capture", "ship", "deliver")
+	if o.Status != StatusDelivered || o.Version != 5 {
+		t.Fatalf("status=%s version=%d", o.Status, o.Version)
+	}
+	if o.ReleasePending || o.RefundPending {
+		t.Error("delivery must not owe anything")
+	}
+	for _, c := range []string{"cancel", "ship", "deliver", "refund", "release"} {
+		if _, err := command(o, c); !errors.Is(err, ErrInvalidTransition) {
+			t.Errorf("%s after delivery: err = %v", c, err)
 		}
 	}
 }

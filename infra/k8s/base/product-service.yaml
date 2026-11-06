@@ -41,7 +41,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: product-service
-          image: gocart/product-service:0.2.0
+          image: gocart/product-service:0.3.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

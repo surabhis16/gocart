@@ -21,7 +21,7 @@ def docs(path):
 
 # 1. Every plain manifest validates against the real Kubernetes schemas.
 manifests = [ROOT/"base/product-service.yaml", ROOT/"base/order-service.yaml",
-             ROOT/"base/payment-service.yaml",
+             ROOT/"base/payment-service.yaml", ROOT/"base/cart-service.yaml",
              ROOT/"cassandra/cassandra.yaml", ROOT/"overlays/local/namespace.yaml",
              ROOT/"overlays/staging/namespace.yaml"]
 n = 0
@@ -91,6 +91,17 @@ for var, want_svc, want_port in (("PRODUCT_URL", "product-service", 8080), ("PAY
     if port != want_port:
         problems.append(f"{want_svc} Service port is {port}, order-service calls {want_port}")
 
+# the Cart service must find both services it calls, and the Order service must
+# be a Service it can reach
+cartc = by_kind[("Deployment", "cart-service")]["spec"]["template"]["spec"]["containers"][0]
+cenv = {e["name"]: e.get("value") for e in cartc["env"]}
+for var, want_svc, want_port in (("PRODUCT_URL", "product-service", 8080), ("ORDER_URL", "order-service", 8081)):
+    if cenv.get(var) != f"http://{want_svc}:{want_port}":
+        problems.append(f"cart-service {var} is {cenv.get(var)}, expected http://{want_svc}:{want_port}")
+cport = by_kind[("Service", "cart-service")]["spec"]["ports"][0]["port"]
+if cport != 8083 or cenv.get("PORT") != "8083":
+    problems.append(f"cart-service must listen on 8083 (Service {cport}, PORT {cenv.get('PORT')})")
+
 # Every secret a workload reads must be produced by every overlay that deploys it.
 needed = set()
 for (kd, _), d in by_kind.items():
@@ -139,6 +150,25 @@ if not isinstance(order.get("env"), list):
 for op in patch:
     if not op["path"].endswith("/env/-") or "/containers/0/" not in op["path"]:
         problems.append(f"unexpected patch path {op['path']}")
+
+# The scale-out patch must leave nothing mounted that no longer exists, and
+# must only touch paths the base really has.
+scale = yaml.safe_load(kust("overlays/staging-cassandra")["patches"][1]["patch"])
+spec = by_kind[("Deployment", "order-service")]["spec"]
+for op in scale:
+    parts = [x for x in op["path"].split("/") if x]
+    node = spec if parts[0] == "spec" else None
+    cur = {"spec": spec}
+    try:
+        for x in parts:
+            cur = cur[int(x)] if isinstance(cur, list) else cur[x]
+    except (KeyError, IndexError, ValueError):
+        problems.append(f"scale-out patch path {op['path']} does not exist in the base")
+ops = {op["path"]: op for op in scale}
+if ops.get("/spec/replicas", {}).get("value", 1) < 2:
+    problems.append("staging-cassandra does not scale order-service past one replica")
+if "/spec/template/spec/volumes" not in ops or "/spec/template/spec/containers/0/volumeMounts" not in ops:
+    problems.append("staging-cassandra scales out but still mounts the file store's volume")
 
 # the tag in staging must equal VERSION
 version = (ROOT/"../../VERSION").read_text().strip()

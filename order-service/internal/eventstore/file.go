@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"gocart/order-service/internal/domain"
 )
@@ -30,6 +31,7 @@ type File struct {
 	size    int64
 	streams map[string][]domain.Event
 	all     []domain.Event
+	touched map[string]time.Time // when this process last appended to each stream
 
 	// RepairedBytes is how much of a torn final write Open discarded.
 	RepairedBytes int64
@@ -38,7 +40,7 @@ type File struct {
 // OpenFile opens (or creates) dir/events.log and replays it into memory. An
 // empty dir gives a memory-only store for tests.
 func OpenFile(dir string) (*File, error) {
-	s := &File{streams: map[string][]domain.Event{}}
+	s := &File{streams: map[string][]domain.Event{}, touched: map[string]time.Time{}}
 	if dir == "" {
 		return s, nil
 	}
@@ -131,7 +133,26 @@ func (s *File) Append(ctx context.Context, e domain.Event) error {
 	}
 	s.streams[e.StreamID] = append(s.streams[e.StreamID], e)
 	s.all = append(s.all, e)
+	s.touched[e.StreamID] = time.Now()
 	return nil
+}
+
+// ChangedSince implements Store. A file has one writer process, so "changed"
+// means appended by this process since it started; anything older was read at
+// startup and is already in every reader's full load.
+func (s *File) ChangedSince(ctx context.Context, since time.Time) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for id, at := range s.touched {
+		if !at.Before(since) {
+			out = append(out, id)
+		}
+	}
+	return out, nil
 }
 
 // Load implements Store.

@@ -508,6 +508,22 @@ func TestCommandsOnTheWrongStateAreRefused(t *testing.T) {
 	if _, err := e.svc.Ship(ctx, ok.Order.ID); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Errorf("ship twice: %v", err)
 	}
+	if _, err := e.svc.Deliver(ctx, "ord_missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("deliver unknown: %v", err)
+	}
+	if _, err := e.svc.Deliver(ctx, rejected.Order.ID); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Errorf("deliver rejected order: %v", err)
+	}
+	v, err := e.svc.Deliver(ctx, ok.Order.ID)
+	if err != nil || v.Status != domain.StatusDelivered {
+		t.Fatalf("deliver shipped order: %v %+v", err, v)
+	}
+	if _, err := e.svc.Deliver(ctx, ok.Order.ID); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Errorf("deliver twice: %v", err)
+	}
+	if _, err := e.svc.Cancel(ctx, ok.Order.ID, ""); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Errorf("cancel delivered order: %v", err)
+	}
 	if _, err := e.svc.Cancel(ctx, "ord_missing", ""); !errors.Is(err, ErrNotFound) {
 		t.Errorf("cancel unknown: %v", err)
 	}

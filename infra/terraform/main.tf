@@ -29,7 +29,7 @@ provider "aws" {
 }
 
 locals {
-  services = toset(["product-service", "order-service", "payment-service"])
+  services = toset(["product-service", "order-service", "payment-service", "cart-service"])
 
   tags = {
     Project   = var.project

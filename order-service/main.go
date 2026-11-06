@@ -11,6 +11,8 @@
 //	CASSANDRA_HOSTS      comma-separated contact points            (cassandra store)
 //	CASSANDRA_KEYSPACE   keyspace holding order_events             (default gocart)
 //	RECONCILE_INTERVAL   how often unfinished orders are retried   (default 5s)
+//	SYNC_INTERVAL        how often this replica reads other replicas' changes  (default 2s)
+//	RESYNC_INTERVAL      how often it also reloads the whole log   (default 5m)
 //	ADMIN_KEY    shared secret for admin endpoints   (unset: they refuse everything)
 //	LOG_LEVEL            debug | info | warn | error               (default info)
 //
@@ -63,6 +65,15 @@ func run(log *slog.Logger, port string) error {
 		return errors.New("RECONCILE_INTERVAL must be a duration of at least 1s, for example 5s")
 	}
 
+	syncEvery, err := time.ParseDuration(env("SYNC_INTERVAL", "2s"))
+	if err != nil || syncEvery < 100*time.Millisecond {
+		return errors.New("SYNC_INTERVAL must be a duration of at least 100ms, for example 2s")
+	}
+	resync, err := time.ParseDuration(env("RESYNC_INTERVAL", "5m"))
+	if err != nil || resync < time.Second {
+		return errors.New("RESYNC_INTERVAL must be a duration of at least 1s, for example 5m")
+	}
+
 	store, err := openStore(log)
 	if err != nil {
 		return err
@@ -76,7 +87,7 @@ func run(log *slog.Logger, port string) error {
 
 	products := productclient.New(env("PRODUCT_URL", "http://localhost:8080"))
 	payments := paymentclient.New(env("PAYMENT_URL", "http://localhost:8082"))
-	svc, err := service.New(store, products, payments, log, service.WithPaymentTTL(ttl))
+	svc, err := service.New(store, products, payments, log, service.WithPaymentTTL(ttl), service.WithResync(resync))
 	if err != nil {
 		return err
 	}
@@ -84,6 +95,7 @@ func run(log *slog.Logger, port string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go svc.RunReconciler(ctx, interval)
+	go svc.RunSync(ctx, syncEvery)
 
 	srv := &http.Server{
 		Addr:              ":" + port,

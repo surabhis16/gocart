@@ -75,6 +75,16 @@ func OpenCassandra(ctx context.Context, cfg CassandraConfig) (*Cassandra, error)
 				at        timestamp,
 				PRIMARY KEY (stream_id, version)
 			) WITH CLUSTERING ORDER BY (version ASC)`, cfg.Keyspace),
+			// A change feed: one row per append, bucketed by hour so no
+			// partition grows without bound, ordered by time within the bucket.
+			// Rows expire after a day; a replica that has been away longer than
+			// that does a full reload instead of reading the feed.
+			fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.order_changes (
+				bucket    text,
+				id        timeuuid,
+				stream_id text,
+				PRIMARY KEY (bucket, id)
+			) WITH CLUSTERING ORDER BY (id ASC) AND default_time_to_live = 86400`, cfg.Keyspace),
 		}
 		for _, stmt := range stmts {
 			if err := boot.Query(stmt).WithContext(ctx).Exec(); err != nil {
@@ -148,7 +158,40 @@ func (c *Cassandra) Append(ctx context.Context, e domain.Event) error {
 	if !applied {
 		return fmt.Errorf("%w: stream %s already has version %d", ErrVersionConflict, e.StreamID, e.Version)
 	}
+	// Record the change for other replicas. The event is already durable, so a
+	// failure here must not fail the append; the worst case is that another
+	// replica hears about this event from its next full reload instead of from
+	// the feed, a few minutes later. now() is the Cassandra node's clock.
+	_ = c.s.Query(`INSERT INTO order_changes (bucket, id, stream_id) VALUES (?, now(), ?)`,
+		feedBucket(time.Now()), e.StreamID).WithContext(ctx).Exec()
 	return nil
+}
+
+// feedBucket names the hour a change belongs to.
+func feedBucket(t time.Time) string { return t.UTC().Format("2006-01-02T15") }
+
+// ChangedSince implements Store. It reads every hourly bucket from since to
+// now, newest rows only (minTimeuuid turns a timestamp into the smallest
+// timeuuid at that instant). Streams can appear more than once.
+func (c *Cassandra) ChangedSince(ctx context.Context, since time.Time) ([]string, error) {
+	now := time.Now().UTC()
+	since = since.UTC()
+	if since.After(now) {
+		return nil, nil
+	}
+	var out []string
+	for b := since.Truncate(time.Hour); !b.After(now); b = b.Add(time.Hour) {
+		it := c.s.Query(`SELECT stream_id FROM order_changes WHERE bucket = ? AND id >= minTimeuuid(?)`,
+			feedBucket(b), since).WithContext(ctx).Iter()
+		var id string
+		for it.Scan(&id) {
+			out = append(out, id)
+		}
+		if err := it.Close(); err != nil {
+			return nil, fmt.Errorf("cassandra: read change feed: %w", err)
+		}
+	}
+	return out, nil
 }
 
 // Load implements Store.

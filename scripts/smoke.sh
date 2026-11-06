@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end check of a RUNNING GoCart stack, using only curl.
 #
-#   ./scripts/smoke.sh                          # against docker compose (8080 / 8081 / 8082)
-#   PRODUCT=... ORDER=... PAYMENT=... ADMIN_KEY=... ./scripts/smoke.sh
+#   ./scripts/smoke.sh                          # against docker compose (8080-8083)
+#   PRODUCT=... ORDER=... PAYMENT=... CART=... ADMIN_KEY=... ./scripts/smoke.sh
 #
 # It uses the demo catalogue the Product service seeds on first start, and it
 # changes stock, so run it against a fresh stack:  docker compose down -v
@@ -15,6 +15,7 @@ set -euo pipefail
 PRODUCT="${PRODUCT:-http://localhost:8080}"
 ORDER="${ORDER:-http://localhost:8081}"
 PAYMENT="${PAYMENT:-http://localhost:8082}"
+CART="${CART:-http://localhost:8083}"
 # Must match the ADMIN_KEY the services were started with (compose defaults to this).
 ADMIN_KEY="${ADMIN_KEY:-dev-admin-key}"
 ADMIN=(-H "Authorization: Bearer $ADMIN_KEY")
@@ -48,8 +49,8 @@ check() { # description expected actual
   fi
 }
 
-echo "Waiting for all three services..."
-for url in "$PRODUCT" "$ORDER" "$PAYMENT"; do
+echo "Waiting for all four services..."
+for url in "$PRODUCT" "$ORDER" "$PAYMENT" "$CART"; do
   for _ in $(seq 1 60); do
     curl -fsS "$url/healthz" >/dev/null 2>&1 && break
     sleep 1
@@ -130,6 +131,8 @@ echo
 echo "Admin operations need the key"
 req POST "$ORDER/orders/$order_id/ship" ''
 check "shipping without a key is 401" 401 "$status"
+req POST "$ORDER/orders/$order_id/deliver" ''
+check "delivering without a key is 401" 401 "$status"
 req GET "$ORDER/orders/$order_id/events" ""
 check "reading the event log without a key is 401" 401 "$status"
 req POST "$PRODUCT/products" '{"name":"Cable","price_minor":19900,"stock":7}'
@@ -139,7 +142,7 @@ check "reading a charge without a key is 401" 401 "$status"
 
 echo
 echo "Every service exposes metrics"
-for svc in "$PRODUCT" "$ORDER" "$PAYMENT"; do
+for svc in "$PRODUCT" "$ORDER" "$PAYMENT" "$CART"; do
   req GET "$svc/metrics" ""
   check "$svc/metrics is 200" 200 "$status"
   check "$svc/metrics has request counters" True "$(python3 -c 'import sys; print("gocart_http_requests_total" in sys.argv[1])' "$body")"
@@ -160,6 +163,48 @@ echo "Cancelling again is refused"
 req POST "$ORDER/orders/$order_id/cancel" ''
 check "409 Conflict" 409 "$status"
 check "problem type is invalid-state" urn:gocart:problem:invalid-state "$(jq_ "d['type']")"
+
+echo
+echo "Cart and checkout: a declined card keeps the cart, a retried checkout makes one order"
+req GET "$CART/carts/cust_cart" ""
+check "a new customer has an empty cart" 0 "$(jq_ "len(d['items'])")"
+req PUT "$CART/carts/cust_cart/items/prd_nope" '{"quantity":1}'
+check "an unknown product cannot be added (422)" 422 "$status"
+req PUT "$CART/carts/cust_cart/items/prd_hub" '{"quantity":2}'
+check "adding the hub is 200" 200 "$status"
+rev=$(jq_ "d['revision']")
+req PUT "$CART/carts/cust_cart/items/prd_hub" '{"quantity":2}'
+check "setting the same quantity again does not change the cart" "$rev" "$(jq_ "d['revision']")"
+check "the cart holds no price" False "$(python3 -c 'import sys; print("price" in sys.argv[1])' "$body")"
+req POST "$CART/carts/cust_cart/checkout" '{"payment_token":"tok_declined"}'
+check "a declined card is 402, passed through from the Order service" 402 "$status"
+req GET "$CART/carts/cust_cart" ""
+check "the cart is kept after a decline" 1 "$(jq_ "len(d['items'])")"
+req POST "$CART/carts/cust_cart/checkout" '{"payment_token":"tok_visa"}'
+check "checking out with another card is 201" 201 "$status"
+cart_order=$(jq_ "d['id']")
+check "the order is confirmed" confirmed "$(jq_ "d['status']")"
+check "hub stock went down by the 2 ordered" 38 "$(stock prd_hub)"
+req POST "$CART/carts/cust_cart/checkout" '{"payment_token":"tok_visa"}'
+check "repeating the checkout is 200, not a second order" 200 "$status"
+check "and it is the same order" "$cart_order" "$(jq_ "d['id']")"
+check "hub stock did not drop again" 38 "$(stock prd_hub)"
+req GET "$CART/carts/cust_cart" ""
+check "the cart says which order it became" "$cart_order" "$(jq_ "d['order_id']")"
+
+echo
+echo "Shipping and delivering: in order, once, and then it is final"
+req POST "$ORDER/orders/$cart_order/deliver" '' "${ADMIN[@]}"
+check "delivering an order that has not shipped is 409" 409 "$status"
+req POST "$ORDER/orders/$cart_order/ship" '' "${ADMIN[@]}"
+check "shipping is 200" 200 "$status"
+req POST "$ORDER/orders/$cart_order/deliver" '' "${ADMIN[@]}"
+check "delivering is 200" 200 "$status"
+check "status is delivered" delivered "$(jq_ "d['status']")"
+req POST "$ORDER/orders/$cart_order/deliver" '' "${ADMIN[@]}"
+check "delivering twice is 409" 409 "$status"
+req POST "$ORDER/orders/$cart_order/cancel" ''
+check "a delivered order cannot be cancelled (409)" 409 "$status"
 
 echo
 echo "One request id follows a request through both services"

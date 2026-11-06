@@ -7,3 +7,4 @@ resources:
   - product-service.yaml
   - order-service.yaml
   - payment-service.yaml
+  - cart-service.yaml

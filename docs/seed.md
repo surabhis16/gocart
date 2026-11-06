@@ -39,7 +39,12 @@ Each job is written as "When ..., I want to ..., so I can ...". They are about o
 - J5. When we stock a new item, I want to add it to the catalogue, so customers can buy it.
 - J6. When a delivery arrives, I want to set the stock level, so the shop does not sell what it has not got.
 - J7. When an order leaves the warehouse, I want to mark it shipped, so the customer's view is true.
+- J14. When an order reaches the customer, I want to mark it delivered, so the order is closed and can no longer be cancelled.
 - J11. When something looks wrong with an order, I want to read its full history and its charge, so I can say what happened.
+
+**Shopper**
+- J15. When I am deciding, I want to put products in a cart and change my mind, so I can buy them together.
+- J16. When I check out, I want one order even if I click twice or the network drops, so I am never charged twice.
 
 **Order service (as a client)**
 - J8. When an order is placed, I want stock held for it, all lines or none, so I never promise what is not there.
@@ -49,7 +54,7 @@ Each job is written as "When ..., I want to ..., so I can ...". They are about o
 
 ## 3. Interaction patterns
 
-Three sequence diagrams, because they show different things.
+Four sequence diagrams, because they show different things.
 
 **The happy path** ([source](diagrams/place-order.mmd)): the Order service records that the order exists *before* it asks the Product service about stock, and records that stock is held *before* it asks the Payment service for money. Each of those decisions is what makes the next diagram possible.
 
@@ -62,6 +67,10 @@ Three sequence diagrams, because they show different things.
 **When payment goes wrong** ([source](diagrams/payment-failure.mmd)): drawing J10 and J12 forced a distinction the first version of the design did not have. "The charge did not go through" means three different things: the card was *declined* (a definite no: give the stock back and tell the customer), the provider *did not answer* (nothing is known: the money may even have been taken, so do not decide anything, ask again), or *nobody paid in time* (give up, give everything back, and make sure a charge still in flight cannot land afterwards). Getting the first two confused would either cancel orders that were paid for or ship goods nobody paid for.
 
 ![Payment failures](diagrams/payment-failure.png)
+
+**When checkout does not get an answer** ([source](diagrams/checkout.mmd)): drawing J16 asked a question the other diagrams skipped: the Cart service calls the Order service, the answer is lost, and the customer clicks again. Did that make two orders? It would have, if the second call looked new. So the cart's state became part of the request: the Idempotency-Key is built from the cart's revision, and a *definite* refusal (as opposed to no answer) is the one thing that changes it. That is the second time the "no answer is not a no" distinction has shaped the design, and it is the same distinction as in the payment diagram, one layer further out.
+
+![Checkout without an answer](diagrams/checkout.png)
 
 The order's life as a state machine ([source](diagrams/order-lifecycle.mmd)):
 
@@ -78,6 +87,10 @@ An **action** changes state; a **query** only reads it. Splitting them this way 
 | J11 | query | `GET /orders/{id}/events` (admin) | Order |
 | J4, J13 | action | `POST /orders/{id}/cancel` (refunds and releases stock) | Order |
 | J7 | action | `POST /orders/{id}/ship` | Order |
+| J14 | action | `POST /orders/{id}/deliver` (shipped orders only; final) | Order |
+| J15 | action | `PUT /carts/{customer_id}/items/{product_id}`, `DELETE` of an item or of the cart | Cart |
+| J15 | query | `GET /carts/{customer_id}` | Cart |
+| J16 | action | `POST /carts/{customer_id}/checkout` (retry-safe; calls `POST /orders`) | Cart |
 | J5 | action | `POST /products` | Product |
 | J6 | action | `PUT /products/{id}/stock` | Product |
 | J3 (browse) | query | `GET /products`, `GET /products/{id}` | Product |
@@ -91,11 +104,12 @@ Two details worth noticing. J2 turned into a header on an existing action rather
 
 ## 5. Specifications in an open standard
 
-All three APIs are described in **OpenAPI 3.0.3**, the open standard:
+All four APIs are described in **OpenAPI 3.0.3**, the open standard:
 
 - [`openapi/product.yaml`](openapi/product.yaml)
 - [`openapi/order.yaml`](openapi/order.yaml)
 - [`openapi/payment.yaml`](openapi/payment.yaml)
+- [`openapi/cart.yaml`](openapi/cart.yaml)
 
 Each documents every endpoint, request body, response, and error (as RFC 9457 problem documents). Money is integer paise throughout. The status codes carry meaning rather than just success/failure: for example `POST /orders` has several different outcomes: `201` confirmed, `200` an idempotent replay, `202` accepted-but-undecided, and for the two failures `409` (stock refused) and `402` (card declined), which the caller must treat differently from each other.
 
@@ -128,7 +142,7 @@ If you are submitting this as coursework, ask a classmate to attempt step 1 and 
 
 ## 7. Implementation
 
-Each of the three services is a separate Go module with no third-party dependencies, built and tested on its own. See the [README](../README.md) for how to run them, and [architecture.md](architecture.md) for why they are shaped the way they are.
+Each of the four services is a separate Go module with no third-party dependencies, built and tested on its own. See the [README](../README.md) for how to run them, and [architecture.md](architecture.md) for why they are shaped the way they are.
 
 ### Microservices versus APIs
 

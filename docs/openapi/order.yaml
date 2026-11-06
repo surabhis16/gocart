@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
   title: GoCart Order Service
-  version: 0.2.0
+  version: 0.3.0
   description: |
-    The Order bounded context: placing, cancelling and shipping orders.
+    The Order bounded context: placing, cancelling, shipping and delivering orders.
 
     **Event sourced.** An order is stored as the list of facts that happened to
     it. `GET /orders/{id}/events` shows that list; every other read is served
@@ -317,6 +317,33 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/InvalidState"
+  /orders/{id}/deliver:
+    post:
+      tags: [lifecycle]
+      operationId: deliverOrder
+      security:
+        - adminKey: []
+      summary: Mark a shipped order as delivered
+      description: |
+        Only a shipped order can be delivered. Delivery is final: a delivered
+        order can no longer be cancelled.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: The delivered order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/InvalidState"
 components:
   parameters:
     OrderId:
@@ -382,12 +409,13 @@ components:
   schemas:
     Status:
       type: string
-      enum: [placed, awaiting_payment, confirmed, rejected, payment_failed, expired, cancelled, shipped]
+      enum: [placed, awaiting_payment, confirmed, rejected, payment_failed, expired, cancelled, shipped, delivered]
       description: |
         `placed` waiting for the Product service; `awaiting_payment` stock held,
         waiting for the Payment service; `confirmed` stock held and paid for;
         `rejected` refused by the Product service; `payment_failed` card
-        declined; `expired` not paid in time; `cancelled`; `shipped`.
+        declined; `expired` not paid in time; `cancelled`; `shipped`; `delivered`
+        reached the customer (final).
     Item:
       type: object
       required: [product_id, quantity]
@@ -506,6 +534,7 @@ components:
             - StockReleased
             - PaymentRefunded
             - OrderShipped
+            - OrderDelivered
             - OrderConfirmed
           description: |
             `OrderConfirmed` appears only in logs written by version 0.1, before

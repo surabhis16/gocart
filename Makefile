@@ -1,6 +1,6 @@
 # Everyday commands. `make help` lists them.
 .DEFAULT_GOAL := help
-SERVICES := product-service order-service payment-service
+SERVICES := product-service order-service payment-service cart-service
 
 .PHONY: help
 help: ## Show this help

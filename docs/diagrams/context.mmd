@@ -1,4 +1,4 @@
-flowchart TB
+flowchart LR
     cust([Customer])
     admin([Admin])
     card[[Card network<br/>mock provider]]
@@ -30,8 +30,18 @@ flowchart TB
         payapi --> led
     end
 
+    subgraph cart_ctx [Cart bounded context]
+        direction TB
+        kapi[HTTP API]
+        carts[(Carts, no prices<br/>carts.json)]
+        kapi --> carts
+    end
+
+    cust -->|build a cart, check out| kapi
+    kapi ==>|place order,<br/>same key on every retry| oapi
+    kapi -.->|does this product exist?| papi
     cust -->|place, cancel, look up| oapi
-    admin -->|ship, read the log| oapi
+    admin -->|ship, deliver, read the log| oapi
     admin -->|add products, restock| papi
     osvc ==>|reserve / release,<br/>retried safely| papi
     osvc ==>|charge / void,<br/>retried safely| payapi

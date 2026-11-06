@@ -1,6 +1,7 @@
 go 1.22
 
 use (
+	./cart-service
 	./order-service
 	./payment-service
 	./product-service

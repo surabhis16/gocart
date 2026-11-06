@@ -9,7 +9,8 @@ stateDiagram-v2
     confirmed --> shipped: OrderShipped
     confirmed --> cancelled: OrderCancelled
     rejected --> [*]
-    shipped --> [*]
+    shipped --> delivered: OrderDelivered
+    delivered --> [*]
     note right of placed
         Product service has not
         answered yet. Reconciled

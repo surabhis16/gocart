@@ -2,13 +2,13 @@
 
 ![GoCart context](diagrams/context.png)
 
-Three services, each in its own bounded context, each owning its own data. The Order service is the only one that talks to the others: it calls `POST /reservations` and `DELETE /reservations/{order_id}` on the Product service, and `POST /charges` and `DELETE /charges/{order_id}` on the Payment service. Product and Payment never talk to each other, and neither knows the other exists.
+Four services, each in its own bounded context, each owning its own data. The Order service coordinates the purchase: it calls `POST /reservations` and `DELETE /reservations/{order_id}` on the Product service, and `POST /charges` and `DELETE /charges/{order_id}` on the Payment service. The Cart service sits in front: it checks that a product exists (`GET /products/{id}`) and, at checkout, places an order (`POST /orders`). Product and Payment never talk to each other, and neither knows the other exists. Nothing calls the Cart service; it is the outermost edge, so a cart outage cannot hurt an order.
 
 ## What makes these microservices (Unit I)
 
 A service earns the name by being changeable and deployable without asking anyone else. In GoCart that is concrete:
 
-- **Separate modules.** `product-service/`, `order-service/` and `payment-service/` have their own `go.mod`, their own Dockerfile and their own tests. None imports another. Each builds and tests from its own directory, and CI runs them as separate matrix jobs.
+- **Separate modules.** `product-service/`, `order-service/`, `payment-service/` and `cart-service/` have their own `go.mod`, their own Dockerfile and their own tests. None imports another. Each builds and tests from its own directory, and CI runs them as separate matrix jobs.
 - **No shared code.** The request-ID, problem-document, metrics and admin-key helpers are a few hundred stable lines and appear in each service. That duplication is deliberate: a shared library would mean a change to it forces every service to release together, which is exactly the coordination cost the architecture exists to avoid. Duplicating a few hundred stable lines is cheaper than that coupling.
 - **No shared data.** See [Data](#data-unit-ii).
 - **One coordination point, written down.** The Order service's whole understanding of the Product service lives in one file, `order-service/internal/productclient/client.go`, and of the Payment service in another, `internal/paymentclient/client.go`. The contracts they rely on are [`openapi/product.yaml`](openapi/product.yaml) and [`openapi/payment.yaml`](openapi/payment.yaml).
@@ -24,6 +24,7 @@ Using the four team types and three interaction modes from *Team Topologies* (Sk
 | **Checkout** | stream-aligned | Order service, its event log and read model | Catalog via **X-as-a-Service** (the Product API) |
 | **Catalog** | stream-aligned | Product service and its data | Checkout via the same API, which it treats as a product with consumers |
 | **Payments** | stream-aligned, but in practice close to a *complicated-subsystem* team | Payment service, the provider integration and the ledger | Checkout via X-as-a-Service. Provider integrations are specialist work (money, regulation, fraud), which is the usual reason to give payments its own team |
+| **Shopping** | stream-aligned | Cart service: what a customer intends to buy, and the checkout call | Checkout via X-as-a-Service (the Order API), Catalog via the Product API |
 | **Platform** | platform | pipeline, Terraform, Kubernetes manifests, the container registry | both, via **X-as-a-Service** (a paved road, not tickets) |
 
 Two additions in practice. For the first few weeks, while the reservation contract is still being found, Checkout and Catalog would use **collaboration** mode, working side by side; once it settles it hardens into X-as-a-Service, and that is the moment to freeze `openapi/product.yaml` behind versioning. And Platform's job is to make the right thing the easy thing: `scripts/ship.sh` and the CI workflows are that, in miniature.
@@ -34,7 +35,7 @@ This project has one author, so one person wears all four hats. The point of wri
 
 ### Domain-driven design
 
-The three bounded contexts are not just folders. Each has its own language, and the same real-world thing means something different in each:
+The bounded contexts are not just folders. Each has its own language, and the same real-world thing means something different in each:
 
 | Concept | In the Product context | In the Order context |
 |---|---|---|
@@ -42,6 +43,7 @@ The three bounded contexts are not just folders. Each has its own language, and 
 | Customer | Does not exist. | A string ID on an order. There is no customer context yet because nothing needs one. |
 | Payment method | Does not exist. | An opaque token the customer supplied. The Order service never learns what is behind it. |
 | Order | Does not exist. Only an `order_id` string that keys a reservation. | The central object: everything that happened to it. |
+| Cart | Does not exist. | Does not exist. An order is what a cart *became*; the Order service never sees a cart, only the lines and a key. In the Cart context the cart is the central object, and it holds no price. |
 | Charge | Does not exist. | Only the *outcome* (a payment reference, or a decline code). |
 | Reservation | The central object: stock held for an order. | Never stored. The order records the *outcome* (stock reserved, with these prices). |
 
@@ -72,7 +74,7 @@ The first three hot spots became the `202 Accepted` outcome and the reconciler, 
 2. **Keep splitting** as the system and its teams grow, guided by where coordination is hurting.
 3. **Be on the right trajectory** for decreasing coordination. That matters far more than whether today's sizing is perfect.
 
-Applied here: three services is principle 1, one per bounded context, and no smaller. The case for *not* splitting further is concrete. Stock and reservations live in the Product service together because reserving is one atomic step: check every line, deduct, and record the reservation, or do none of it. Splitting "Inventory" from "Reservations" would turn that into a distributed transaction, which is the problem the design is avoiding.
+Applied here: four services is principle 1, one per bounded context, and no smaller. The Cart service earned its place by *changing for different reasons*: carts are edited constantly and thrown away, orders are permanent records, and a bug in one should never be able to damage the other. The case for *not* splitting further is concrete. Stock and reservations live in the Product service together because reserving is one atomic step: check every line, deduct, and record the reservation, or do none of it. Splitting "Inventory" from "Reservations" would turn that into a distributed transaction, which is the problem the design is avoiding.
 
 The likeliest first split, principle 2, would be **Catalog** (names, descriptions, prices: read-heavy, edited by merchandisers) away from **Inventory** (stock and reservations: write-heavy, changes every order). They change at different speeds and for different reasons, so they would eventually want different owners and release rhythms. The trigger is not "it feels big", it is "two teams keep waiting on each other to change this service". Until then, splitting is cost without benefit, and the splitting direction is easier to reverse than merging.
 
@@ -113,10 +115,12 @@ What this buys, and where in the code:
 
 **CQRS** (Command Query Responsibility Segregation) means the model that *decides* and the model that *answers* are different things:
 
-- **Command side:** `POST /orders`, `.../cancel`, `.../ship`. These load the order's events, replay them, decide, and append. They never read the projection.
+- **Command side:** `POST /orders`, `.../cancel`, `.../ship`, `.../deliver`. These load the order's events, replay them, decide, and append. They never read the projection.
 - **Query side:** `GET /orders`, `GET /orders/{id}`. These read `internal/projection`, a flat in-memory view with a by-customer index, shaped for the API instead of for decisions. They never replay events.
 
-*An honest qualifier:* here both sides live in one process, and the view is updated immediately after each append, under a lock. That is CQRS with separate models, not with separate infrastructure, and it is not eventually consistent. What does hold is the separation that matters: commands decide from the log, queries read the view, and the view can be rebuilt at any time. Putting the view in another process, fed by a change feed, would be a transport change, not a redesign. See the scaling limits below.
+*An honest qualifier:* the two sides share a process, and the view is updated right after each append, under a lock. That is CQRS with separate models, not with separate infrastructure. What does hold is the separation that matters: commands decide from the log, queries read the view, and the view can be rebuilt at any time.
+
+**Running more than one Order replica** (Cassandra store). Each replica has its own view, so each must learn about orders the others handled. Appending an event also writes the order's id to a small `order_changes` table (bucketed by hour, ordered by timeuuid, expiring after a day). Every `SYNC_INTERVAL` (2s) a replica reads the ids changed since its last look, minus a 10s overlap, and replays just those streams into its view. Applying an event is idempotent per version, so overlap and duplicates are harmless. The feed is only a *hint*: every `RESYNC_INTERVAL` (5m) a replica reloads the whole log, so a lost feed row delays a view by minutes instead of leaving it wrong forever. Commands first catch up on the order they touch, and `GET /orders/{id}` falls back to the log when the view has not seen the order, so those two are never stale. A list (`GET /orders`) can trail another replica by up to `SYNC_INTERVAL`. That is the eventual consistency CQRS signs up for, stated rather than hidden. Both replicas run the reconciler; that is safe because every step it takes (reserve, charge, release, void) is idempotent per order. Covered by `internal/service/sync_test.go`, including a lost feed, a failed sync and concurrent load across replicas.
 
 ### Event sourcing and CQRS beyond microservices
 
@@ -183,16 +187,29 @@ Cancelling needs care at one moment: an order is abandoned while its charge requ
 
 A payment token is an opaque reference to a payment method, never a card number. The Order service refuses anything that is not shaped like `tok_` plus lowercase letters, digits and underscores, *before* writing the event, because an append-only log is the worst possible place for a card number: it can never be edited out. The Payment service applies the same rule independently. The token is kept in `OrderPlaced` so a payment that could not complete can be retried without asking the customer again; it is never returned by the API, and `GET /orders/{id}/events` strips it from the payload. (The log file itself does hold it. A real system would store a customer's saved payment-method id and let the provider own the secret.)
 
+## Carts and checkout
+
+The Cart service is small on purpose. Its whole job is to remember what a customer intends to buy and to turn that into one order exactly once. ![Checkout](diagrams/checkout.png)
+
+- **A cart holds no price.** A copy would go stale, then disagree with what the Order service charges. The cart shows names; the order carries the prices quoted by the Product service when stock is reserved.
+- **Adding a product checks that it exists** (one `GET` to the Product service), and only the first time: changing a quantity needs no lookup, so it works through a Product outage. An outage is reported as `503`, never as "unknown product", which would be a lie.
+- **Checkout is retry-safe by construction.** Every cart has a *revision* that moves on each real change. Checkout sends `Idempotency-Key: cart:<customer>:<revision>`, so the same cart in the same state is always the same key, and the Order service has the final say on duplicates. That gives three cases, each tested: no answer leaves the cart untouched and the retry finds the order if one was made; an answer that is lost on its way back leaves the cart marked with its `order_id`, so a repeat replays the same order (`200`); a definite refusal (declined card, out of stock) moves the cart to a *new* revision, because the old key would replay the refusal forever.
+- **A checked-out cart is frozen, not emptied.** It keeps its lines so a repeated checkout can be answered. The next change to it starts a fresh cart.
+- **An edit made while checkout is in flight is never lost**, and is never mislabelled as part of the order: marking a cart as ordered only happens if its revision is still the one that was sent.
+- **Checkout passes the Order service's answer through**, status and body, so `402`, `409` and `202` reach the customer exactly as the Order service said them. The Cart service does not restate that contract; its spec points at the Order spec.
+
 ## Known limits
 
 Written down so they are choices you can defend rather than surprises:
 
 | Limit | Why it is acceptable here | What removing it would take |
 |---|---|---|
-| **One replica of each service.** | Product's and Payment's state is one file each (one writer), and Payment's one-charge-per-order guarantee relies on a lock inside the process. Order's read model is in memory and only sees commands handled by that same process, so a second replica would answer queries from a view that never saw the first one's orders. | Product and Payment: a real database that can enforce uniqueness across replicas. Order: a change feed from the event store to every replica's read model. |
+| **One replica of Product and Payment; Order scales only on Cassandra.** | Product's and Payment's state is one file each (one writer), and Payment's one-charge-per-order guarantee relies on a lock inside the process. Order with the file store is the same. Order on Cassandra runs two replicas in `staging-cassandra`, synchronised by the change feed above, so its lists can lag by a couple of seconds. | Product and Payment: a real database that can enforce uniqueness across replicas. Order: a push-based feed (or a log with subscriptions) instead of polling. |
+| **One replica of the Cart service, and anyone can use any customer's cart.** | Carts are one file with one writer, and there are no logins, same as orders. A lost cart costs a customer a minute, not money, and checkout's safety does not depend on the Cart service at all. | Carts in a shared store (Redis or Postgres) and the customer identity that the auth row below would bring. |
+| **A cart does not hold stock.** | Reserving stock for people who are only browsing starves buyers; the reservation happens at checkout, where the money is. The cost is that checkout can discover the stock has gone, and says so (`409`). | A short-lived reservation at add-to-cart, with its own expiry, which is a second saga to run. |
 | **The reconciler polls**, rather than being triggered. | Simple, and safe because every step it repeats is idempotent. Worst case is a delay of a few seconds. | A transactional outbox, which is more moving parts for a latency win nobody needs yet. |
 | **Product rewrites its whole snapshot on every change.** | Fine for a catalogue of thousands of rows; every mutation is atomic and crash-safe. | A database, once the catalogue outgrows a few MB. |
-| **Only a shared admin key; no per-user auth, TLS or rate limiting.** Shipping, stock changes, the event log and charge look-ups need `ADMIN_KEY`. Nothing identifies customers, so anyone who knows an order id can cancel it. And the Payment service's `POST /charges` and `DELETE /charges/{order_id}` are open to anyone who can reach its port. | It is a teaching project and runs on localhost. | Customer identity (tokens) and ownership checks on orders; a NetworkPolicy or mutual TLS so only the Order service can reach Payment; an API gateway for TLS and rate limiting. |
+| **Only a shared admin key; no per-user auth, TLS or rate limiting.** Shipping, delivering, stock changes, the event log and charge look-ups need `ADMIN_KEY`. Nothing identifies customers, so anyone who knows an order id can cancel it. And the Payment service's `POST /charges` and `DELETE /charges/{order_id}` are open to anyone who can reach its port. | It is a teaching project and runs on localhost. | Customer identity (tokens) and ownership checks on orders; a NetworkPolicy or mutual TLS so only the Order service can reach Payment; an API gateway for TLS and rate limiting. |
 | **The payment provider is a mock, and the token is stored in the event log.** | There is no real money, and the token is an opaque test string. | A real provider integration with its own idempotency keys, webhooks for late outcomes, and saved payment-method ids instead of tokens. |
 | **Unpaid stock is held for a fixed time** (`PAYMENT_TTL`, 15 minutes), checked by the polling reconciler. | Simple, and safe: expiry also voids any in-flight charge. | A per-order timer or a delayed message, and a reservation that the Product service itself expires. |
 | **Startup replays the whole event log** to rebuild the read model. | Measured on generated logs, in this sandbox: 10,000 orders (20,000 events) start in about 0.17 s; 100,000 orders (200,000 events, 51 MB) in about 2.0 s. Linear, so a million orders would be around 20 s. | Snapshots in the read model, or a persisted projection. |
