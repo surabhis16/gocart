@@ -34,9 +34,9 @@ func TestCassandraStoreMeetsTheContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, tbl := range []string{"order_events", "order_changes"} {
-    		if err := s.s.Query(`TRUNCATE ` + tbl).Exec(); err != nil {
-        		t.Fatalf("truncate %s: %v", tbl, err)
-    		}
+			if err := s.s.Query(`TRUNCATE ` + tbl).Exec(); err != nil {
+				t.Fatalf("truncate %s: %v", tbl, err)
+			}
 		}
 		t.Cleanup(func() { _ = s.Close() })
 		return s
