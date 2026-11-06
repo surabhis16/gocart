@@ -4,8 +4,11 @@
 #   ./scripts/smoke.sh                          # against docker compose (8080-8083)
 #   PRODUCT=... ORDER=... PAYMENT=... CART=... ADMIN_KEY=... ./scripts/smoke.sh
 #
-# It uses the demo catalogue the Product service seeds on first start, and it
-# changes stock, so run it against a fresh stack:  docker compose down -v
+# It uses the demo catalogue the Product service seeds on first start. Every
+# expectation about stock is relative to what the stack holds when the script
+# starts, and every key and customer is unique to the run, so it can be run
+# again on the same stack. (A fresh stack is still the cleanest start:
+# docker compose down -v. Each run leaves one extra product behind.)
 #
 # The failure-and-recovery demos are scripts/outage-demo.sh (a service goes
 # away mid-order) and scripts/oversell-demo.sh (many buyers, little stock);
@@ -19,6 +22,7 @@ CART="${CART:-http://localhost:8083}"
 # Must match the ADMIN_KEY the services were started with (compose defaults to this).
 ADMIN_KEY="${ADMIN_KEY:-dev-admin-key}"
 ADMIN=(-H "Authorization: Bearer $ADMIN_KEY")
+RUN="$(date +%s)"   # makes this run's keys and customers its own, so it can be repeated
 
 pass=0
 fail=0
@@ -63,21 +67,23 @@ charge_status() { req GET "$PAYMENT/charges/$1" "" "${ADMIN[@]}"; jq_ "d['status
 types() { req GET "$ORDER/orders/$1/events" "" "${ADMIN[@]}"; jq_ "','.join(e['type'] for e in d['events'])"; }
 
 echo
-echo "Place an order for 2 keyboards (stock 25) and 1 hub (stock 40)"
-req POST "$ORDER/orders" '{"customer_id":"cust_smoke","payment_token":"tok_visa","items":[{"product_id":"prd_keyboard","quantity":2},{"product_id":"prd_hub","quantity":1}]}' -H 'Idempotency-Key: smoke-1'
+echo "Place an order for 2 keyboards and 1 hub"
+keyboards=$(stock prd_keyboard)
+hubs=$(stock prd_hub)
+req POST "$ORDER/orders" '{"customer_id":"cust_smoke","payment_token":"tok_visa","items":[{"product_id":"prd_keyboard","quantity":2},{"product_id":"prd_hub","quantity":1}]}' -H "Idempotency-Key: smoke-1-$RUN"
 check "201 Created" 201 "$status"
 check "status is confirmed" confirmed "$(jq_ "d['status']")"
 check "total is 2*499900 + 249900 paise" 1249700 "$(jq_ "d['total_minor']")"
 order_id=$(jq_ "d['id']")
-check "keyboard stock fell to 23" 23 "$(stock prd_keyboard)"
-check "hub stock fell to 39" 39 "$(stock prd_hub)"
+check "keyboard stock fell by 2" $((keyboards - 2)) "$(stock prd_keyboard)"
+check "hub stock fell by 1" $((hubs - 1)) "$(stock prd_hub)"
 
 echo
 echo "Retry the same request with the same Idempotency-Key"
-req POST "$ORDER/orders" '{"customer_id":"cust_smoke","payment_token":"tok_visa","items":[{"product_id":"prd_keyboard","quantity":2},{"product_id":"prd_hub","quantity":1}]}' -H 'Idempotency-Key: smoke-1'
+req POST "$ORDER/orders" '{"customer_id":"cust_smoke","payment_token":"tok_visa","items":[{"product_id":"prd_keyboard","quantity":2},{"product_id":"prd_hub","quantity":1}]}' -H "Idempotency-Key: smoke-1-$RUN"
 check "200 OK, not a second order" 200 "$status"
 check "same order id" "$order_id" "$(jq_ "d['id']")"
-check "keyboard stock still 23" 23 "$(stock prd_keyboard)"
+check "keyboard stock did not fall again" $((keyboards - 2)) "$(stock prd_keyboard)"
 
 echo
 echo "Order more lamps than exist (stock 3)"
@@ -153,8 +159,8 @@ echo "Cancel the order: stock must come back"
 req POST "$ORDER/orders/$order_id/cancel" '{"reason":"smoke test"}'
 check "200 OK" 200 "$status"
 check "status is cancelled" cancelled "$(jq_ "d['status']")"
-check "keyboard stock restored to 25" 25 "$(stock prd_keyboard)"
-check "hub stock restored to 40" 40 "$(stock prd_hub)"
+check "keyboard stock restored" "$keyboards" "$(stock prd_keyboard)"
+check "hub stock restored" "$hubs" "$(stock prd_hub)"
 check "history ends with the stock released and the payment refunded" "OrderPlaced,StockReserved,PaymentCaptured,OrderCancelled,StockReleased,PaymentRefunded" "$(types "$order_id")"
 check "the charge is now voided" voided "$(charge_status "$order_id")"
 
@@ -166,30 +172,34 @@ check "problem type is invalid-state" urn:gocart:problem:invalid-state "$(jq_ "d
 
 echo
 echo "Cart and checkout: a declined card keeps the cart, a retried checkout makes one order"
-req GET "$CART/carts/cust_cart" ""
+# A product made for this run (5 in stock), so the sold items never drain the demo catalogue.
+req POST "$PRODUCT/products" '{"name":"Smoke widget","price_minor":10000,"stock":5}' "${ADMIN[@]}"
+check "an admin can create a product" 201 "$status"
+widget=$(jq_ "d['id']")
+req GET "$CART/carts/cust_cart_$RUN" ""
 check "a new customer has an empty cart" 0 "$(jq_ "len(d['items'])")"
-req PUT "$CART/carts/cust_cart/items/prd_nope" '{"quantity":1}'
+req PUT "$CART/carts/cust_cart_$RUN/items/prd_nope" '{"quantity":1}'
 check "an unknown product cannot be added (422)" 422 "$status"
-req PUT "$CART/carts/cust_cart/items/prd_hub" '{"quantity":2}'
-check "adding the hub is 200" 200 "$status"
+req PUT "$CART/carts/cust_cart_$RUN/items/$widget" '{"quantity":2}'
+check "adding a product is 200" 200 "$status"
 rev=$(jq_ "d['revision']")
-req PUT "$CART/carts/cust_cart/items/prd_hub" '{"quantity":2}'
+req PUT "$CART/carts/cust_cart_$RUN/items/$widget" '{"quantity":2}'
 check "setting the same quantity again does not change the cart" "$rev" "$(jq_ "d['revision']")"
 check "the cart holds no price" False "$(python3 -c 'import sys; print("price" in sys.argv[1])' "$body")"
-req POST "$CART/carts/cust_cart/checkout" '{"payment_token":"tok_declined"}'
+req POST "$CART/carts/cust_cart_$RUN/checkout" '{"payment_token":"tok_declined"}'
 check "a declined card is 402, passed through from the Order service" 402 "$status"
-req GET "$CART/carts/cust_cart" ""
+req GET "$CART/carts/cust_cart_$RUN" ""
 check "the cart is kept after a decline" 1 "$(jq_ "len(d['items'])")"
-req POST "$CART/carts/cust_cart/checkout" '{"payment_token":"tok_visa"}'
+req POST "$CART/carts/cust_cart_$RUN/checkout" '{"payment_token":"tok_visa"}'
 check "checking out with another card is 201" 201 "$status"
 cart_order=$(jq_ "d['id']")
 check "the order is confirmed" confirmed "$(jq_ "d['status']")"
-check "hub stock went down by the 2 ordered" 38 "$(stock prd_hub)"
-req POST "$CART/carts/cust_cart/checkout" '{"payment_token":"tok_visa"}'
+check "stock went down by the 2 ordered" 3 "$(stock "$widget")"
+req POST "$CART/carts/cust_cart_$RUN/checkout" '{"payment_token":"tok_visa"}'
 check "repeating the checkout is 200, not a second order" 200 "$status"
 check "and it is the same order" "$cart_order" "$(jq_ "d['id']")"
-check "hub stock did not drop again" 38 "$(stock prd_hub)"
-req GET "$CART/carts/cust_cart" ""
+check "stock did not drop again" 3 "$(stock "$widget")"
+req GET "$CART/carts/cust_cart_$RUN" ""
 check "the cart says which order it became" "$cart_order" "$(jq_ "d['order_id']")"
 
 echo

@@ -15,7 +15,7 @@ The parts worth seeing:
 
 ```
 docker compose up --build        # Product :8080, Order :8081, Payment :8082, Cart :8083
-./scripts/smoke.sh               # 71 checks across all four services
+./scripts/smoke.sh               # 72 checks across all four services
 ./scripts/oversell-demo.sh       # many buyers, little stock
 ./scripts/outage-demo.sh         # Product down, then Payment down
 ```
@@ -44,4 +44,3 @@ gocart-umbrella/
 ├── .github/workflows/        ci.yml, release.yml
 └── Makefile                  `make help`
 ```
-
