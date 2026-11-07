@@ -33,6 +33,8 @@ func TestCassandraStoreMeetsTheContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Both tables: the change feed lives beside the log, and rows left in it
+		// by one check would show up as changes in the next.
 		for _, tbl := range []string{"order_events", "order_changes"} {
 			if err := s.s.Query(`TRUNCATE ` + tbl).Exec(); err != nil {
 				t.Fatalf("truncate %s: %v", tbl, err)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end check of a RUNNING GoCart stack, using only curl.
 #
-#   ./scripts/smoke.sh                          # against docker compose (8080-8083)
-#   PRODUCT=... ORDER=... PAYMENT=... CART=... ADMIN_KEY=... ./scripts/smoke.sh
+#   ./scripts/smoke.sh                          # against docker compose (8080-8083, and the web gateway on 3000)
+#   PRODUCT=... ORDER=... PAYMENT=... CART=... WEB=... ADMIN_KEY=... ./scripts/smoke.sh
 #
 # It uses the demo catalogue the Product service seeds on first start. Every
 # expectation about stock is relative to what the stack holds when the script
@@ -19,6 +19,7 @@ PRODUCT="${PRODUCT:-http://localhost:8080}"
 ORDER="${ORDER:-http://localhost:8081}"
 PAYMENT="${PAYMENT:-http://localhost:8082}"
 CART="${CART:-http://localhost:8083}"
+WEB="${WEB:-http://localhost:3000}"
 # Must match the ADMIN_KEY the services were started with (compose defaults to this).
 ADMIN_KEY="${ADMIN_KEY:-dev-admin-key}"
 ADMIN=(-H "Authorization: Bearer $ADMIN_KEY")
@@ -53,8 +54,8 @@ check() { # description expected actual
   fi
 }
 
-echo "Waiting for all four services..."
-for url in "$PRODUCT" "$ORDER" "$PAYMENT" "$CART"; do
+echo "Waiting for all five services..."
+for url in "$PRODUCT" "$ORDER" "$PAYMENT" "$CART" "$WEB"; do
   for _ in $(seq 1 60); do
     curl -fsS "$url/healthz" >/dev/null 2>&1 && break
     sleep 1
@@ -216,6 +217,25 @@ check "delivering twice is 409" 409 "$status"
 req POST "$ORDER/orders/$cart_order/cancel" ''
 check "a delivered order cannot be cancelled (409)" 409 "$status"
 
+echo
+echo "The web gateway: the app, the allow-list, and one real request through it"
+req GET "$WEB/" "" -D /tmp/smoke-web-headers.$$
+check "the app is served at /" 200 "$status"
+check "it is the single-page app" 1 "$(grep -c '<div id="root">' <<<"$body")"
+check "a deep link falls back to the app" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$WEB/orders/ord_anything")"
+check "responses carry a content security policy" 1 "$(grep -ic '^content-security-policy:' /tmp/smoke-web-headers.$$)"
+rm -f /tmp/smoke-web-headers.$$
+req GET "$WEB/api/products" ""
+check "the catalogue comes through the gateway" 200 "$status"
+req GET "$WEB/api/reservations" ""
+check "stock reservations are not reachable from a browser (404)" 404 "$status"
+req POST "$WEB/api/charges" '{"order_id":"x","amount_minor":1}'
+check "creating a charge is not reachable from a browser (404)" 404 "$status"
+req GET "$WEB/api/status" ""
+check "the gateway reports on every service" 4 "$(jq_ "len([s for s in d['services'] if s['up']])")"
+req GET "$WEB/api/carts/cust_cart_$RUN" ""
+check "a cart reads through the gateway" 200 "$status"
+check "and is the same cart the Cart service holds" "$cart_order" "$(jq_ "d['order_id']")"
 echo
 echo "One request id follows a request through both services"
 req GET "$ORDER/orders/ord_does_not_exist" "" -H 'X-Request-ID: smoke-trace-1'

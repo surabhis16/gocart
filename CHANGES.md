@@ -1,20 +1,19 @@
-# Changes in 0.3.0 (from 0.2.0)
+# Changes in 0.4.0 (from 0.3.0)
 
-Adds a Cart service with a retry-safe checkout, an order delivery step, and lets the Order service run more than one replica on Cassandra. If you committed 0.2.0 to git first, `git diff` after unzipping shows exactly this.
+Adds a web storefront and admin console, served by a fifth service. Nothing in the four existing services changed. If you committed 0.3.0 to git first, `git diff` after unzipping shows exactly this.
 
 ## New
-- **`cart-service/`** (port 8083): `GET /carts/{customer_id}`, `PUT` and `DELETE /carts/{customer_id}/items/{product_id}`, `DELETE /carts/{customer_id}`, `POST /carts/{customer_id}/checkout`. A cart holds no prices. Checkout sends the Order service an `Idempotency-Key` built from the cart's revision, so a retried checkout cannot create a second order; a declined card moves the cart to a new revision so another card can be tried. Contract: `docs/openapi/cart.yaml`. Diagram: `docs/diagrams/checkout.*`.
-- **`POST /orders/{id}/deliver`** (admin key): only a `shipped` order can be delivered, and `delivered` is final (a delivered order cannot be cancelled). New status `delivered`, new event `OrderDelivered`.
-- **Order replicas share a change feed.** Appending an event also records the order's id in an `order_changes` table (Cassandra); each replica polls it (`SYNC_INTERVAL`, default 2s) and reloads the whole log now and then (`RESYNC_INTERVAL`, default 5m) as a backstop. Commands and `GET /orders/{id}` are never stale; a list can trail by up to `SYNC_INTERVAL`. The `staging-cassandra` overlay now runs two Order replicas with a rolling update.
-- Compose, Kubernetes, Terraform (fourth repository and log group), CI and release matrices, `ship.sh`, `cleanup.sh`, `bump-version.sh` and `check-k8s.py` all cover the fourth service. `smoke.sh` now has 72 checks (cart, checkout, ship then deliver).
+- **`web-service/`** (port 3000): a Go gateway (standard library only) that embeds the compiled React app and forwards an allow-list of `/api/*` routes to the other four services. Stock reservations and charge creation are not forwarded. Errors keep their problem format; an unreachable service is a `502` naming it. `GET /api/status` reports each service's health. A test ties every forwarded route to the OpenAPI files.
+- **`web-service/frontend/`**: React 19, TypeScript, Vite, Tailwind, React Router, TanStack Query. Shop, cart with a test-payment-method picker (declined, no funds, expired, flaky, slow and down cards), orders, an order page set out as a receipt that updates itself while the order settles, cancel, and an admin console behind the admin key (orders with ship, deliver and cancel; an order inspector with the charge and the full event log; products and stock; service health). API types are generated from `docs/openapi/`. A guide for whoever restyles it is in `frontend/DESIGN.md`.
+- Multi-stage `Dockerfile` (Node builds the app, Go embeds it, `scratch` runs it), compose (port 3000), a Kubernetes manifest with two replicas and a rolling update, a Terraform repository and log group, a `frontend` CI job (type-check, lint, tests, build, generated types up to date), release matrix, `ship.sh`, `cleanup.sh`, `bump-version.sh`, `check-k8s.py`, and `make web` / `make web-dev`.
+- `smoke.sh` has 82 checks: ten new ones cover the gateway (app served, deep links, security header, internal routes refused, a cart read through it).
 
 ## Compatibility
-- Everything is additive. No existing endpoint changed.
-- A log that contains `OrderDelivered` cannot be read by a 0.2 binary (replay refuses unknown event types, on purpose). Roll forward, not back, once an order has been delivered.
-- The file store needs no change. A Cassandra keyspace gains the `order_changes` table, which the service creates itself on start.
-
-## Fixed after first run
-`smoke.sh` assumed a fresh stack (hub stock exactly 40) and failed with 4 checks on a stack that had already been used. Its stock checks are now relative to what the stack holds, its keys and customer are unique per run, and the cart section sells a product it creates itself, so it can be run repeatedly.
+- Everything is additive. Ports 8080 to 8083 and every endpoint are unchanged.
+- Terraform gains one repository and one log group (the plan grows by the resources for the fifth service).
 
 ## Numbers
-213 tests (262 with subtests), up from 164 (211). All run with `-race`.
+227 Go tests (276 with subtests, all with `-race`) and 20 front-end tests.
+
+## Verified here, and not
+Run here: all Go tests, the front-end tests, type-check, lint and production build; the real stack of five processes with the built app, driven in a real browser (browse, add to cart, pay, receipt, admin unlock, order inspector, system page); `smoke.sh` 82 of 82; `check-k8s.py`; `docker compose config`. Not run here: the Docker image build (the Node stage and the new CI job have not run), Terraform, and the Kubernetes deployment of the gateway.

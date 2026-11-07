@@ -1,0 +1,9 @@
+Dockerfile
+.dockerignore
+*_test.go
+frontend/node_modules
+frontend/dist
+frontend/**/*.test.ts
+frontend/**/*.test.tsx
+internal/ui/dist/*
+!internal/ui/dist/.gitkeep

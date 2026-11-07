@@ -1,0 +1,115 @@
+@import "@fontsource-variable/bricolage-grotesque";
+@import "@fontsource-variable/instrument-sans";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* The palette. Values are "R G B" so Tailwind can apply opacity to them.
+   Change these and the whole app, light and dark, follows.
+
+   canvas   cool concrete, the page            ink     bottle green, nearly black
+   surface  paper, panels and the receipt      brand   tag magenta: price and the main action, nowhere else
+   sunken   inset areas                         line    ink at low strength              */
+:root {
+  --canvas: 230 235 232;
+  --surface: 247 249 247;
+  --sunken: 216 224 220;
+  --ink: 14 42 35;
+  --muted: 79 103 95;
+  --line: 14 42 35;
+  --brand: 211 18 111;
+  --brand-ink: 255 255 255;
+  --ok: 23 112 63;
+  --warn: 168 90 0;
+  --bad: 179 38 30;
+  --info: 11 106 133;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: 10 21 18;
+    --surface: 18 33 28;
+    --sunken: 27 46 40;
+    --ink: 230 239 234;
+    --muted: 150 175 166;
+    --line: 230 239 234;
+    --brand: 255 95 162;
+    --brand-ink: 26 6 16;
+    --ok: 94 214 142;
+    --warn: 245 175 70;
+    --bad: 255 130 120;
+    --info: 110 200 225;
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  html {
+    font-feature-settings: "tnum" 1, "ss01" 1; /* figures line up in columns; prices and totals read as tables */
+  }
+  body {
+    @apply bg-canvas font-sans text-ink antialiased;
+  }
+  h1,
+  h2,
+  h3 {
+    @apply font-display tracking-tight;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand;
+  }
+  ::selection {
+    @apply bg-brand text-brand-ink;
+  }
+}
+
+@layer components {
+  /* A flat panel: a hairline of ink, no shadow, no gradient. */
+  .panel {
+    @apply rounded-md border border-ink/20 bg-surface;
+  }
+  .input {
+    @apply w-full rounded-md border border-ink/30 bg-surface px-3 py-2 text-sm placeholder:text-muted focus:border-ink focus:outline-none focus:ring-2 focus:ring-brand/40;
+  }
+
+  /* The receipt: paper with a serrated top and bottom edge, like thermal print. */
+  .receipt {
+    --tooth: 10px;
+    position: relative;
+    @apply bg-surface text-ink;
+    padding-block: calc(var(--tooth) + 1.5rem);
+    -webkit-mask:
+      conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(var(--tooth) * 2) 51% repeat-x,
+      conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg) top / calc(var(--tooth) * 2) 51% repeat-x;
+    mask:
+      conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(var(--tooth) * 2) 51% repeat-x,
+      conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg) top / calc(var(--tooth) * 2) 51% repeat-x;
+  }
+
+  /* Name ........ amount, the way a receipt sets a line. */
+  .leader {
+    @apply flex items-baseline gap-2;
+  }
+  .leader::after {
+    content: "";
+    order: 2;
+    @apply mx-1 min-w-4 flex-1 border-b border-dotted border-ink/40;
+  }
+  .leader > :first-child {
+    order: 1;
+  }
+  .leader > :last-child {
+    order: 3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -72,6 +72,7 @@ ship() { # service tag [docker build args...]
 ship product-service "$version"
 ship payment-service "$version"
 ship cart-service "$version"
+ship web-service "$version"
 if [[ $variant == cassandra ]]; then
   ship order-service "${version}${tag_suffix}" --build-arg TAGS=cassandra
 else
@@ -87,6 +88,7 @@ fi
 kubectl -n "$ns" rollout status deployment/product-service --timeout=180s
 kubectl -n "$ns" rollout status deployment/payment-service --timeout=180s
 kubectl -n "$ns" rollout status deployment/cart-service --timeout=180s
+kubectl -n "$ns" rollout status deployment/web-service --timeout=180s
 kubectl -n "$ns" rollout status deployment/order-service --timeout=600s
 
 cat <<MSG
@@ -97,6 +99,7 @@ Staging is up. Reach it from this machine with:
   kubectl -n ${ns} port-forward svc/order-service   8081:8081 &
   kubectl -n ${ns} port-forward svc/payment-service 8082:8082 &
   kubectl -n ${ns} port-forward svc/cart-service    8083:8083 &
+  kubectl -n ${ns} port-forward svc/web-service     3000:3000 &
   ./scripts/smoke.sh
 
 Show the outage-and-recovery behaviour here:

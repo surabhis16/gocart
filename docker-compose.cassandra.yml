@@ -27,7 +27,7 @@ services:
     build:
       args:
         TAGS: cassandra # compiles the Cassandra event store into the binary
-    image: gocart/order-service:${VERSION:-0.3.0}-cassandra
+    image: gocart/order-service:${VERSION:-0.4.0}-cassandra
     environment:
       EVENT_STORE: cassandra
       CASSANDRA_HOSTS: cassandra

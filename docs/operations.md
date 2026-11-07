@@ -19,7 +19,7 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 docker compose up --build
 ```
 
-Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>, Cart on <http://localhost:8083>. The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
+Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>, Cart on <http://localhost:8083>, and the storefront on <http://localhost:3000> (the admin console is at `/admin`; the key is `dev-admin-key` unless you set `ADMIN_KEY`). The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
 
 ```
 curl -s localhost:8080/products | python3 -m json.tool
@@ -41,7 +41,7 @@ You will see `OrderPlaced`, `StockReserved`, `PaymentCaptured`. The payment toke
 
 Three scripts exercise it end to end (use a fresh stack for `smoke.sh`: `docker compose down -v`):
 
-- `./scripts/smoke.sh`: 71 checks across all four services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), shipped then delivered, admin endpoints refused without the key, metrics present.
+- `./scripts/smoke.sh`: 82 checks across all five services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), shipped then delivered, admin endpoints refused without the key, the gateway serving the app and refusing internal routes, metrics present.
 - `./scripts/oversell-demo.sh`: 20 customers each click "buy" twice at the same instant, for 3 lamps. It checks that exactly 3 orders were confirmed, stock ended at 0, exactly 3 charges were taken and no double-click was charged twice. It sets the stock itself, so it can be re-run.
 - `./scripts/outage-demo.sh`: two acts. The Product service goes down mid-order, then the Payment service does; each time the order is accepted (`202`), and finishes by itself when the service returns, with stock reserved once and money taken once.
 
@@ -53,7 +53,11 @@ export ADMIN_KEY=dev-admin-key
 (cd payment-service && go run .)                       # :8082
 (cd order-service   && go run .)                       # :8081
 (cd cart-service    && go run .)                       # :8083
+(cd web-service/frontend && npm ci && npm run build)   # once; needs Node 22
+(cd web-service     && go run .)                       # :3000
 ```
+
+For front-end work, `make web-dev` serves the app with hot reload on <http://localhost:5173>, proxying `/api` to a running gateway. Without the build step the gateway still runs and says the front end is not built.
 
 Data goes to `./data` in each directory. Configuration is by environment variable; the full list is at the top of each `main.go`.
 
@@ -63,7 +67,7 @@ Data goes to `./data` in each directory. Configuration is by environment variabl
 make test
 ```
 
-Format check, `go vet` and the race detector for all four services: 213 tests (262 counting subtests). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
+Format check, `go vet` and the race detector for all five Go modules: 227 tests (276 counting subtests). The front end has its own (`cd web-service/frontend && npm test`, 20 tests, run in CI with type-check, lint and build). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
 
 ## Developer workspace (Unit IV)
 
@@ -132,11 +136,11 @@ The manifests make a few choices on purpose; each is commented in the YAML:
 | The pipeline is the only path to a release | tag `v*` triggers `release.yml` |
 | Small, frequent, reversible changes | one `VERSION`, one-command bump (`scripts/bump-version.sh`), idempotent operations |
 | Environments are reproducible | `docker compose up`, `kubectl apply -k` |
-| Know when it is broken | structured JSON logs, a request ID across all four services, a Prometheus `/metrics` endpoint on each, health endpoints |
+| Know when it is broken | structured JSON logs, a request ID across all five services, a Prometheus `/metrics` endpoint on each, health endpoints |
 
 ### Terraform
 
-`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) for each of the four services, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
+`infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) for each of the five services, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
 
 There is deliberately **no VPC, load balancer or cluster**. Those are the expensive parts of AWS, and this project runs on a laptop. The practice, which is what Unit III teaches, is infrastructure described in files, reviewed, planned, and applied by a pipeline.
 

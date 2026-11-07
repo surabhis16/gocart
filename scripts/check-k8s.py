@@ -21,7 +21,7 @@ def docs(path):
 
 # 1. Every plain manifest validates against the real Kubernetes schemas.
 manifests = [ROOT/"base/product-service.yaml", ROOT/"base/order-service.yaml",
-             ROOT/"base/payment-service.yaml", ROOT/"base/cart-service.yaml",
+             ROOT/"base/payment-service.yaml", ROOT/"base/cart-service.yaml", ROOT/"base/web-service.yaml",
              ROOT/"cassandra/cassandra.yaml", ROOT/"overlays/local/namespace.yaml",
              ROOT/"overlays/staging/namespace.yaml"]
 n = 0
@@ -101,6 +101,17 @@ for var, want_svc, want_port in (("PRODUCT_URL", "product-service", 8080), ("ORD
 cport = by_kind[("Service", "cart-service")]["spec"]["ports"][0]["port"]
 if cport != 8083 or cenv.get("PORT") != "8083":
     problems.append(f"cart-service must listen on 8083 (Service {cport}, PORT {cenv.get('PORT')})")
+
+# the web gateway must find all four services it forwards to
+webc = by_kind[("Deployment", "web-service")]["spec"]["template"]["spec"]["containers"][0]
+wenv = {e["name"]: e.get("value") for e in webc["env"]}
+for var, want_svc, want_port in (("PRODUCT_URL", "product-service", 8080), ("ORDER_URL", "order-service", 8081),
+                                 ("PAYMENT_URL", "payment-service", 8082), ("CART_URL", "cart-service", 8083)):
+    if wenv.get(var) != f"http://{want_svc}:{want_port}":
+        problems.append(f"web-service {var} is {wenv.get(var)}, expected http://{want_svc}:{want_port}")
+wport = by_kind[("Service", "web-service")]["spec"]["ports"][0]["port"]
+if wport != 3000 or wenv.get("PORT") != "3000":
+    problems.append(f"web-service must listen on 3000 (Service {wport}, PORT {wenv.get('PORT')})")
 
 # Every secret a workload reads must be produced by every overlay that deploys it.
 needed = set()

@@ -1,0 +1,75 @@
+# Web gateway: serves the React app and forwards /api/* to the other services.
+# It keeps no state, so unlike Cart and Payment it runs two replicas and rolls
+# updates without downtime. Only routes on its allow-list are forwarded; the
+# service-to-service endpoints (stock reservations, creating charges) are not.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-service
+  labels:
+    app.kubernetes.io/name: web-service
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-service
+        app.kubernetes.io/component: frontend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: web-service
+          image: gocart/web-service:0.4.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - { name: PORT, value: "3000" }
+            - { name: LOG_LEVEL, value: info }
+            - { name: PRODUCT_URL, value: "http://product-service:8080" }
+            - { name: ORDER_URL, value: "http://order-service:8081" }
+            - { name: PAYMENT_URL, value: "http://payment-service:8082" }
+            - { name: CART_URL, value: "http://cart-service:8083" }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+  labels:
+    app.kubernetes.io/name: web-service
+spec:
+  selector:
+    app.kubernetes.io/name: web-service
+  ports:
+    - { name: http, port: 3000, targetPort: http }

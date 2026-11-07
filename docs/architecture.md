@@ -198,6 +198,17 @@ The Cart service is small on purpose. Its whole job is to remember what a custom
 - **An edit made while checkout is in flight is never lost**, and is never mislabelled as part of the order: marking a cart as ordered only happens if its revision is still the one that was sent.
 - **Checkout passes the Order service's answer through**, status and body, so `402`, `409` and `202` reach the customer exactly as the Order service said them. The Cart service does not restate that contract; its spec points at the Order spec.
 
+## The web gateway and the storefront
+
+The browser talks to one origin, the Web service, and never to the four services directly.
+
+- **An allow-list, not a pass-through.** The gateway forwards exactly the routes a shopper or an admin needs (catalogue, carts, orders and their events, charge look-ups, health) and answers `404` to everything else. The endpoints that exist for services to call each other, stock reservations and creating or voiding charges, are not reachable from a browser at all. A test compares the forwarded routes with the OpenAPI files, so a route cannot be forwarded without being specified.
+- **It adds no business logic.** Status codes and problem bodies pass through unchanged, so `402`, `409` and `202` mean to the page what they mean to a script. When a service cannot be reached the gateway answers `502` with the same problem format and says which one.
+- **One app, one file.** The compiled React app is embedded in the Go binary (`go:embed`), so the image is a single static file in `scratch`. Unknown paths fall back to `index.html` so deep links work; unknown `/api/` paths are `404` problems, never HTML.
+- **The front end is typed from the contract.** Its API types are generated from `docs/openapi/*.yaml` and CI fails if the generated files are stale.
+- **The UI keeps the same promises as the API.** Checkout shows "we could not confirm" for no answer and "declined" for a definite no, and the retry button after the first is safe because the Cart service derives its idempotency key from the cart. While an order is settling the page polls; the order page reads like a receipt, the admin order page shows the event log it was built from.
+- **The admin key lives in memory only.** It is checked against a read-only endpoint, kept for the tab's lifetime and sent only on admin requests.
+
 ## Known limits
 
 Written down so they are choices you can defend rather than surprises:
@@ -206,6 +217,7 @@ Written down so they are choices you can defend rather than surprises:
 |---|---|---|
 | **One replica of Product and Payment; Order scales only on Cassandra.** | Product's and Payment's state is one file each (one writer), and Payment's one-charge-per-order guarantee relies on a lock inside the process. Order with the file store is the same. Order on Cassandra runs two replicas in `staging-cassandra`, synchronised by the change feed above, so its lists can lag by a couple of seconds. | Product and Payment: a real database that can enforce uniqueness across replicas. Order: a push-based feed (or a log with subscriptions) instead of polling. |
 | **One replica of the Cart service, and anyone can use any customer's cart.** | Carts are one file with one writer, and there are no logins, same as orders. A lost cart costs a customer a minute, not money, and checkout's safety does not depend on the Cart service at all. | Carts in a shared store (Redis or Postgres) and the customer identity that the auth row below would bring. |
+| **The gateway is a single trust boundary without TLS, sessions or rate limits.** The customer id in the storefront is a label kept in the browser, not a login. | Same reasoning as the access-control row below: a teaching project on localhost. The allow-list is what keeps internal endpoints private. | A real identity provider, TLS at an ingress, and per-customer ownership checks in the services. |
 | **A cart does not hold stock.** | Reserving stock for people who are only browsing starves buyers; the reservation happens at checkout, where the money is. The cost is that checkout can discover the stock has gone, and says so (`409`). | A short-lived reservation at add-to-cart, with its own expiry, which is a second saga to run. |
 | **The reconciler polls**, rather than being triggered. | Simple, and safe because every step it repeats is idempotent. Worst case is a delay of a few seconds. | A transactional outbox, which is more moving parts for a latency win nobody needs yet. |
 | **Product rewrites its whole snapshot on every change.** | Fine for a catalogue of thousands of rows; every mutation is atomic and crash-safe. | A database, once the catalogue outgrows a few MB. |

@@ -7,7 +7,7 @@ Where each topic of the Microservices Architecture syllabus (Units I to V) is co
 | I | What are microservices; reducing coordination costs | [architecture.md](architecture.md#what-makes-these-microservices-unit-i) | separate modules, no shared code or data, one written-down contract |
 | I | Team topologies | [architecture.md](architecture.md#team-topology) | stream-aligned and platform teams, with interaction modes |
 | I | SEED(S): actors, jobs, sequence diagrams | [seed.md](seed.md) | 3 actors, 13 jobs, 3 sequence diagrams |
-| I | Actions and queries from jobs; open-standard spec | [openapi/](openapi) | OpenAPI 3.0.3 for all four services, enforced by a test |
+| I | Actions and queries from jobs; open-standard spec | [openapi/](openapi) | OpenAPI 3.0.3 for the four back-end services, enforced by a test |
 | I | Microservices versus APIs | [seed.md](seed.md#microservices-versus-apis) | |
 | II | Service boundaries, DDD, event storming | [architecture.md](architecture.md#boundaries-unit-ii) | four bounded contexts that each mean something different by "order" and "product" |
 | II | Universal sizing formula | [architecture.md](architecture.md#the-universal-sizing-formula) | why four services, and the likely first split |
@@ -21,7 +21,8 @@ Where each topic of the Microservices Architecture syllabus (Units I to V) is co
 | IV | Observability and access control (extra) | [operations.md](operations.md#admin-key-and-metrics) | `/metrics` on every service, admin endpoints behind a key |
 | IV | **Cassandra** | `eventstore/cassandra.go`, `docker-compose.cassandra.yml`, `infra/k8s/cassandra/` | the same event-store contract on Cassandra (see the verification table in the [README](../README.md#what-is-verified-and-what-is-not)) |
 | IV | **Kubernetes** | `infra/k8s/` | Kustomize base and three overlays, hardened pods |
-| IV | Designing endpoints; second microservice; **umbrella project** | this repository | one repo, `go.work`, four independently built services |
+| IV | API gateway and front end (extra) | [architecture.md](architecture.md#the-web-gateway-and-the-storefront), `web-service/` | allow-listed gateway, embedded React app, types generated from the OpenAPI files |
+| IV | Designing endpoints; second microservice; **umbrella project** | this repository | one repo, `go.work`, five independently built services |
 | V | Staging environment, shipping and deploying the container, clean up | `scripts/ship.sh`, `scripts/cleanup.sh`, `release.yml` | registry flow into a `gocart-staging` namespace |
 | V | Managing change | [operations.md](operations.md#managing-change-unit-v) | additive, breaking and stored-data changes, each handled differently; 0.1 to 0.2 is a worked example of the last two |
 | V | Complexity and simplification; measuring progress | [operations.md](operations.md#measuring-progress-unit-v) | delivery and coordination metrics, with real numbers |

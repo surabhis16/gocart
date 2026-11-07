@@ -2,6 +2,7 @@ go 1.22
 
 use (
 	./cart-service
+	./web-service
 	./order-service
 	./payment-service
 	./product-service

@@ -15,13 +15,16 @@ secretGenerator:
 images:
   - name: gocart/product-service
     newName: localhost:5000/gocart/product-service
-    newTag: 0.3.0
+    newTag: 0.4.0
   - name: gocart/order-service
     newName: localhost:5000/gocart/order-service
-    newTag: 0.3.0
+    newTag: 0.4.0
   - name: gocart/payment-service
     newName: localhost:5000/gocart/payment-service
-    newTag: 0.3.0
+    newTag: 0.4.0
   - name: gocart/cart-service
     newName: localhost:5000/gocart/cart-service
-    newTag: 0.3.0
+    newTag: 0.4.0
+  - name: gocart/web-service
+    newName: localhost:5000/gocart/web-service
+    newTag: 0.4.0

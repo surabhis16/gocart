@@ -10,11 +10,11 @@ name: gocart
 # It is a demo default; a real deployment injects a secret, never a literal.
 x-admin: &admin-key ${ADMIN_KEY:-dev-admin-key}
 
-x-version: &version ${VERSION:-0.3.0}
+x-version: &version ${VERSION:-0.4.0}
 
 services:
   product-service:
-    image: gocart/product-service:${VERSION:-0.3.0}
+    image: gocart/product-service:${VERSION:-0.4.0}
     build:
       context: ./product-service
       args:
@@ -29,7 +29,7 @@ services:
     # Each service owns its data: there is no database both can reach.
 
   order-service:
-    image: gocart/order-service:${VERSION:-0.3.0}
+    image: gocart/order-service:${VERSION:-0.4.0}
     build:
       context: ./order-service
       args:
@@ -52,7 +52,7 @@ services:
     restart: unless-stopped
 
   cart-service:
-    image: gocart/cart-service:${VERSION:-0.3.0}
+    image: gocart/cart-service:${VERSION:-0.4.0}
     build:
       context: ./cart-service
       args:
@@ -71,8 +71,26 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  web-service:
+    image: gocart/web-service:${VERSION:-0.4.0}
+    build:
+      context: ./web-service
+      args:
+        VERSION: *version
+    environment:
+      PRODUCT_URL: http://product-service:8080
+      ORDER_URL: http://order-service:8081
+      PAYMENT_URL: http://payment-service:8082
+      CART_URL: http://cart-service:8083
+    ports:
+      - "3000:3000"
+    depends_on:
+      cart-service:
+        condition: service_healthy # start-up order only; the gateway reports any service that is down and keeps serving
+    restart: unless-stopped
+
   payment-service:
-    image: gocart/payment-service:${VERSION:-0.3.0}
+    image: gocart/payment-service:${VERSION:-0.4.0}
     build:
       context: ./payment-service
       args:
