@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [product-service, order-service]
+        service: [product-service, order-service, payment-service, cart-service, web-service]
     defaults:
       run:
         working-directory: ${{ matrix.service }}
@@ -35,6 +35,31 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+
+  # The React front end: type-checked, linted, unit-tested and built exactly as
+  # the Dockerfile builds it. Its API types are generated from docs/openapi/, so
+  # a spec change that breaks the UI fails here and not in a browser.
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web-service/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-service/frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Generated API types are up to date
+        run: |
+          npm run gen:api
+          git diff --exit-code -- src/api/generated
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
 
   # The Cassandra event store is behind a build tag and needs a real Cassandra,
   # so it gets its own job: compile it, then run the exact contract tests the
@@ -105,8 +130,8 @@ jobs:
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.cassandra.yml config --quiet
 
-  # The real thing: build both images, start them, and drive them over HTTP,
-  # including taking the Product service away mid-flow.
+  # The real thing: build the images, start them, and drive them over HTTP,
+  # including taking the Product and Payment services away mid-flow.
   end-to-end:
     runs-on: ubuntu-latest
     needs: test
@@ -116,6 +141,8 @@ jobs:
         run: docker compose up -d --build --wait --wait-timeout 120
       - name: Smoke test
         run: ./scripts/smoke.sh
+      - name: Oversell (many buyers, little stock)
+        run: ./scripts/oversell-demo.sh
       - name: Outage and recovery
         run: |
           docker compose down -v

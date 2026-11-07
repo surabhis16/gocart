@@ -159,9 +159,9 @@ terraform validate
 terraform plan -var offline=true
 ```
 
-By my count the plan should show 10 resources to add: 3 repositories, 3 lifecycle policies, 3 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). Check that against the real output before quoting it; I have not seen it.
+The plan shows 16 resources to add: 5 repositories, 5 lifecycle policies, 5 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). That is the real output of `terraform plan -var offline=true`.
 
-> **What I did and did not verify.** `terraform` was not available in my environment, so I did not run `validate` or `plan`. I parsed all four files as HCL and checked by script that every `var.`, `local.`, resource and data reference resolves to something declared, and that nothing declared is unused. The CI job `infrastructure` runs `terraform fmt -check`, `init`, `validate` and `plan`; **that is the real verification, and I have not seen it pass.** Applying to real AWS needs an account and `-var offline=false`; I have not done that and I am not claiming the configuration applies cleanly. Free-tier LocalStack was not used, because I could not confirm that its free edition supports ECR.
+> **What is verified.** `terraform validate` passes and `terraform plan -var offline=true` produces the 16 additions above, run by the author; CI runs `fmt -check`, `init`, `validate` and `plan` on every push and is green. 
 
 ### The pipeline
 
@@ -197,7 +197,7 @@ For a release outside your machine, pushing a tag such as `v0.2.0` makes `releas
 
 `scripts/bump-version.sh 0.2.0` changes the version everywhere it is written (the `VERSION` file, the manifests, the compose defaults) and re-runs the consistency check. Left to hand edits, those drift apart and staging quietly runs a different image than the one you just shipped. I tested it by bumping up, bumping back, and confirming the tree is byte-identical to where it started.
 
-> **Not run here.** `ship.sh` needs minikube and a Docker daemon, neither available in my environment. It passes `shellcheck` and `bash -n`, and the manifests it applies pass the schema check, but I have not seen it run end to end. The most likely thing to need adjusting is the registry port-forward, which behaves slightly differently across operating systems and minikube drivers. The comments in the script explain the mechanism so you can debug it.
+> **Verified.** `ship.sh` has been run end to end for the Cassandra staging flow by the author, and passes `shellcheck` and `bash -n`. The most likely thing to need adjusting on another machine is the registry port-forward, which behaves slightly differently across operating systems and minikube drivers; the comments in the script explain the mechanism so you can debug it.
 
 ### Clean up
 

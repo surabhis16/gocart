@@ -1,6 +1,6 @@
 name: release
 
-# Push a tag like v0.2.0 and both images are built and published to GitHub's
+# Push a tag like v0.2.0 and all three images are built and published to GitHub's
 # free container registry (ghcr.io). This is "shipping the container".
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [product-service, order-service]
+        service: [product-service, order-service, payment-service, cart-service, web-service]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

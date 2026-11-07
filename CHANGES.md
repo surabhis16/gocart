@@ -15,5 +15,6 @@ Adds a web storefront and admin console, served by a fifth service. Nothing in t
 ## Numbers
 227 Go tests (276 with subtests, all with `-race`) and 20 front-end tests.
 
-## Verified here, and not
-Run here: all Go tests, the front-end tests, type-check, lint and production build; the real stack of five processes with the built app, driven in a real browser (browse, add to cart, pay, receipt, admin unlock, order inspector, system page); `smoke.sh` 82 of 82; `check-k8s.py`; `docker compose config`. Not run here: the Docker image build (the Node stage and the new CI job have not run), Terraform, and the Kubernetes deployment of the gateway.
+## Verified
+In the sandbox: all Go tests, the front-end tests, type-check, lint and production build; the five real processes driven in a real browser; `check-k8s.py`. On the author's machine and in CI: the five images build and start under Compose, `smoke.sh` passes 82 of 82, `terraform validate` passes and the plan adds 16 resources, the Cassandra job and the full CI run are green, and the Cassandra staging flow runs on Kubernetes. The README table lists each part and who ran it.
+

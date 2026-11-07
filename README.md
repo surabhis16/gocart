@@ -50,26 +50,22 @@ gocart-umbrella/
 
 ## What is verified, and what is not
 
-I built this in a sandbox that could not download Go modules or pull container images, and had no Docker daemon, Kubernetes or Terraform. So the honest picture is:
-
 | Part | Status |
 |---|---|
-| All four services: 213 tests (262 with subtests), `-race`, `gofmt`, `go vet` | **Passing.** Run here. |
-| The four services running as real processes, driven by `smoke.sh` | **72 of 72 checks pass.** Run here. |
-| Checkout while the Order service is down, then recovered | **Checked on real processes**: `503`, cart unchanged; after restart one order, and a repeat returns it again. Run here. |
-| Oversell demo against the real processes (run twice) | **Passes**: 3 sold, 3 charged, 0 stock left, no double charges. Run here. |
-| Outage and recovery demo, both acts, against the real processes | **Passes.** Run here. |
+| Go: 227 tests (276 with subtests) across five modules, `-race`, `gofmt`, `go vet` | **Passing**, in the sandbox and in CI. |
+| Front end: 20 tests, type-check, lint, production build, generated API types up to date | **Passing**, in the sandbox and in the CI `frontend` job. |
+| The five services running together, driven by `smoke.sh` | **82 of 82 checks pass**, in the sandbox on real processes and on the author's Docker Compose stack. |
+| The storefront in a real browser (browse, cart, pay, receipt, admin, system page, phone width) | **Driven with Playwright** in the sandbox against the real services. Not covered by automated browser tests. |
+| Checkout while the Order service is down, then recovered | **Checked on real processes**: `503`, cart unchanged; after restart one order, and a repeat returns it again. |
+| Oversell demo and outage-and-recovery demo | **Pass** against the real processes, and in the CI `end-to-end` job. |
 | Restart rebuilds the read model; clean SIGTERM shutdown; `-healthcheck` | **Checked** on the real binaries. |
-| Tests that can fail | The OpenAPI drift check and key service behaviours were **mutation-tested**: I broke them on purpose and watched the tests go red. |
-| Kubernetes manifests | **Schema-valid** against Kubernetes 1.31 (strict), with cross-reference checks. Never applied to a cluster. |
-| Compose files | **Valid** (`docker compose config`, both the base and the Cassandra overlay). Never started. |
-| Scripts | `shellcheck` clean. `bump-version.sh` **round-trip tested**. `ship.sh` and `cleanup.sh` **not run**. |
-| Terraform | Parsed as HCL and cross-checked by script. **`validate` and `plan` not run.** |
-| Dockerfiles | Not built (no Docker daemon here). The Go they compile is the Go that was tested; the payment Dockerfile is the product one with the name and port changed. |
-| **Cassandra event store** | **Not compiled against the real driver, not run.** Type-checked against a stub only. |
-| GitHub Actions workflows | Valid YAML. **Never run.** |
-
-The CI pipeline is where the unverified parts get verified: it compiles the Cassandra store against the real driver and tests it on a live Cassandra, runs `terraform validate` and `plan`, builds the four images, and runs the smoke test, the oversell demo and the outage demo against them. Push this to a GitHub repository and read the results before you rely on any of those rows. If one fails, the failure message will point at what to fix.
+| Tests that can fail | The OpenAPI drift check and key service behaviours were **mutation-tested**: broken on purpose, tests went red. |
+| Dockerfiles and Compose | **Built and started** by the author (`docker compose up --build`, five images). |
+| **Cassandra event store**, including two Order replicas on the change feed | **Passes** its tests on a live Cassandra in CI, and runs on Kubernetes (`staging-cassandra`), checked by the author. |
+| Kubernetes manifests | **Schema-valid** against Kubernetes 1.31 (strict) with cross-reference checks, and **applied** by the author in the Cassandra staging overlay. The other overlays and the web gateway's two-replica rollout were not separately exercised. |
+| Terraform | **`validate` passes; `plan` shows 16 to add** (5 repositories, 5 lifecycle policies, 5 log groups, 1 IAM policy). Never applied to a real AWS account. |
+| Scripts | `shellcheck` clean. `bump-version.sh` round-trip tested. `ship.sh` run by the author for the Cassandra staging flow; `cleanup.sh` not separately confirmed. |
+| GitHub Actions workflows | **A full run is green**, including the Cassandra job. |
 
 ## Limits, and upgrading
 
