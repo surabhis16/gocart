@@ -269,7 +269,7 @@ and remove the `secretGenerator` from the overlay so it does not overwrite yours
 
 Customers sign in through Dex (an OpenID Connect provider) and the gateway vouches for them to the Order and Cart services; how it works is in [architecture.md](architecture.md#who-is-asking-sign-in-and-ownership).
 
-**Compose, first run (no setup).** `docker compose up --build`, open <http://localhost:3000>, press *Sign in*. Dex is on :5556 and, with nothing configured, offers three demo accounts (password `gocart-demo`): `user1@gocart.test`, `user2@gocart.test` and `admin@gocart.test` (the administrator). Sign in as Asha, add to a cart, then as Ravi in a private window: his cart and orders are his own, and her order's address answers `404`.
+**Compose, first run (no setup).** `docker compose up --build`, open <http://localhost:3000>, press *Sign in*. Dex is on :5556 and, with nothing configured, offers three demo accounts (password `gocart-demo`): `asha@gocart.test`, `ravi@gocart.test` and `admin@gocart.test` (the administrator). Sign in as Asha, add to a cart, then as Ravi in a private window: his cart and orders are his own, and her order's address answers `404`.
 
 **Compose, with Google or GitHub.** Dex offers each sign-in method whose settings you give it, in a `.env` file (copy `.env.example`; git ignores `.env`). Creating a customer is automatic: a first sign-in is the sign-up, and the customer id comes from the provider's account id.
 
@@ -295,7 +295,48 @@ Then open <https://gocart.localtest.me:8443> (that name always resolves to 127.0
 
 Traefik rate-limits each client address (a steady 20 requests a second with bursts to 60, and 2 a second with bursts to 10 on `/auth/`; see `infra/k8s/edge/edge.yaml`) and caps request bodies at 64 KiB. To try it: `for i in $(seq 60); do curl -sk -o /dev/null -w '%{http_code} ' https://gocart.localtest.me:8443/auth/login; done` and watch `429` appear.
 
-**Google and GitHub on Kubernetes.** Same two registrations, but with your public address: the callback is `https://<your host>/dex/callback`. Add the four values to the `gocart-auth` Secret under the keys `google-client-id`, `google-client-secret`, `github-client-id`, `github-client-secret` (Dex starts offering each method as soon as its pair exists; restart the `dex` Deployment), and set `admin-emails` in `gocart-public` to your address. The `local` and `staging` overlays are demos: they switch the throwaway accounts on (`dex-demo-users=true`) and name `admin@gocart.test` the administrator, which you would remove for a real deployment.
+**Kubernetes does not read `.env`.** That file only feeds docker compose. In the cluster the same settings live in the `gocart-auth` Secret (the secrets and the four Google and GitHub values) and the `gocart-public` ConfigMap (`dex-demo-users`, `admin-emails`, `signin-hint`), and the `local` and `staging` overlays create both with demo values. Do not patch them by hand: the next `kubectl apply -k` puts the demo values back. Instead keep your own values in a private overlay that is applied on top:
+
+```
+cp -r infra/k8s/overlays/local-https-private.example infra/k8s/overlays/local-https-private
+cd infra/k8s/overlays/local-https-private
+cp secrets.env.example secrets.env && cp public.env.example public.env   # fill both in
+cd - && kubectl apply -k infra/k8s/overlays/local-https-private
+```
+
+`secrets.env` and `public.env` are ignored by git. The pods roll by themselves, because Kustomize renames the generated Secret and ConfigMap when their contents change. For a staging cluster, make the same overlay on top of `staging`.
+
+**Google and GitHub on Kubernetes (Kubernetes does not read `.env`).** The `.env` file only feeds Docker Compose. In the cluster the same settings live in two objects the overlay creates with demo values: the `gocart-auth` Secret (the signing secrets, plus `google-client-id`, `google-client-secret`, `github-client-id`, `github-client-secret`) and the `gocart-public` ConfigMap (`dex-demo-users`, `admin-emails`, `signin-hint`). Editing `.env` therefore changes nothing there, and Dex shows no Google or GitHub buttons until the Secret holds the keys.
+
+Register the same two apps as for compose, but with your public address: the callback is `https://<your host>/dex/callback` (locally `https://gocart.localtest.me:8443/dex/callback`). Then keep your real values in a **private overlay** that sits on top of the shared one, instead of patching live objects (a later `kubectl apply -k` would put the demo values back):
+
+```
+infra/k8s/overlays/local-https-private/
+  kustomization.yaml
+  secrets.env      # google-client-id=...  google-client-secret=...  github-client-id=...  github-client-secret=...
+  public.env       # dex-demo-users=false  and  admin-emails=you@example.com
+```
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../local-https
+secretGenerator:
+  - name: gocart-auth
+    behavior: merge
+    envs:
+      - secrets.env
+configMapGenerator:
+  - name: gocart-public
+    behavior: merge
+    envs:
+      - public.env
+```
+
+`kubectl apply -k infra/k8s/overlays/local-https-private` then regenerates both objects, updates the hashed ConfigMap name in the Deployments, and the pods that read them restart by themselves. `.gitignore` excludes `*.env`, so the secrets never reach git; do not commit the two `.env` files, and give each teammate their own. If you must patch live objects instead, remember that Kustomize adds a hash to the ConfigMap's name (`kubectl get cm` shows the real one), that pods read environment variables only when they start (restart the Deployments), and that the next apply will overwrite your patch. In `staging`, which `ship.sh` deploys, do the same with a private overlay on top of `staging`.
+
+The `local` and `staging` overlays are demos: they switch the throwaway accounts on (`dex-demo-users=true`) and name `admin@gocart.test` the administrator, which a private overlay replaces.
 
 **Secrets.** Three values sign and verify: `IDENTITY_SECRET` (shared by the gateway, Order and Cart; at least 32 characters, or the service refuses to start), `SESSION_SECRET` (the gateway only) and `OIDC_CLIENT_SECRET` (the gateway and Dex). The demo values are literals in compose and the overlays. For anything real:
 
