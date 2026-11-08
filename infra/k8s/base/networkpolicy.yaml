@@ -1,0 +1,96 @@
+# Who may talk to whom. Without these, any pod in the cluster can call the Order
+# service and mint its own orders; with them, only the callers below can reach
+# each service, and only on its own port. The browser's only way in is the
+# ingress controller, which may reach the web gateway and Dex and nothing else.
+#
+# Policies are enforced by the cluster's network plugin. Where it does not
+# enforce them (some local setups) they are silently inert, so treat them as a
+# second lock, not the first: the services also refuse requests without the
+# gateway's signed identity.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [web-service, dex] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-dex
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: dex }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: web-service }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: product-callers
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: product-service }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: web-service } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: order-service } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: cart-service } }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order-callers
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: order-service }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: web-service } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: cart-service } }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-callers
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: payment-service }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: web-service } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: order-service } }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cart-callers
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: cart-service }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: web-service } }

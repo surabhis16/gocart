@@ -1,0 +1,10 @@
+# The local overlay plus the HTTPS front door. Needs Traefik and cert-manager
+# installed first (docs/operations.md). The namespace is repeated on purpose: the
+# edge objects are added here, outside the overlay that sets it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gocart-local
+resources:
+  - ../local
+components:
+  - ../../edge

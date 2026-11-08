@@ -14,6 +14,8 @@
 //	SYNC_INTERVAL        how often this replica reads other replicas' changes  (default 2s)
 //	RESYNC_INTERVAL      how often it also reloads the whole log   (default 5m)
 //	ADMIN_KEY    shared secret for admin endpoints   (unset: they refuse everything)
+//	IDENTITY_SECRET  signs the gateway's identity assertion (32+ characters)
+//	REQUIRE_IDENTITY "true": customer routes refuse callers that are not signed in
 //	LOG_LEVEL            debug | info | warn | error               (default info)
 //
 // The cassandra store is compiled in only with `-tags cassandra`.
@@ -35,6 +37,7 @@ import (
 
 	"gocart/order-service/internal/eventstore"
 	"gocart/order-service/internal/httpapi"
+	"gocart/order-service/internal/identity"
 	"gocart/order-service/internal/paymentclient"
 	"gocart/order-service/internal/productclient"
 	"gocart/order-service/internal/service"
@@ -154,7 +157,20 @@ func apiOptions(log *slog.Logger) []httpapi.Option {
 	if key == "" {
 		log.Warn("ADMIN_KEY is not set: admin endpoints will refuse every request")
 	}
-	return []httpapi.Option{httpapi.WithAdminKey(key), httpapi.WithVersion(version)}
+	secret := []byte(env("IDENTITY_SECRET", ""))
+	switch {
+	case len(secret) == 0:
+		log.Warn("IDENTITY_SECRET is not set: signed identities from the gateway will be refused, and customer routes are open to anyone who can reach this port")
+	case len(secret) < identity.MinSecretLen:
+		log.Error("IDENTITY_SECRET is too short", "min", identity.MinSecretLen)
+		os.Exit(2)
+	}
+	require := env("REQUIRE_IDENTITY", "") == "true"
+	if require && len(secret) == 0 {
+		log.Error("REQUIRE_IDENTITY needs IDENTITY_SECRET")
+		os.Exit(2)
+	}
+	return []httpapi.Option{httpapi.WithAdminKey(key), httpapi.WithIdentity(secret, require), httpapi.WithVersion(version)}
 }
 
 func probe(port string) int {

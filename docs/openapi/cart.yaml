@@ -25,9 +25,11 @@ info:
     A checked-out cart keeps the lines that were bought. The next change to it
     (adding, removing, clearing) starts a fresh cart.
 
-    **There are no customer logins yet.** The customer id is in the path and
-    nothing checks who is asking, exactly as with orders. It is limited to
-    `A-Z a-z 0-9 . _ -`, 1-64 characters.
+    **A cart belongs to the signed-in customer.** The customer id is in the path
+    and must match the identity the gateway signed (`X-Gocart-Identity`, see the
+    `identity` security scheme): another customer's cart is `403`, and with
+    `REQUIRE_IDENTITY=true` a request with no identity is `401`. The id is
+    limited to `A-Z a-z 0-9 . _ -`, 1-64 characters.
 
     **Errors** are RFC 9457 problem documents (`application/problem+json`) whose
     `type` is a URN, listed under `Problem`.
@@ -84,6 +86,10 @@ paths:
       summary: Get a customer's cart
       description: A customer with no cart has an empty one, at revision 0.
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: The cart.
           content:
@@ -98,6 +104,10 @@ paths:
       summary: Empty the cart
       description: Idempotent. Clearing an empty cart succeeds and changes nothing.
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "204":
           description: The cart is empty.
         "422":
@@ -128,6 +138,10 @@ paths:
             schema:
               $ref: "#/components/schemas/SetItem"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: The cart after the change.
           content:
@@ -164,6 +178,10 @@ paths:
       summary: Take a product out of the cart
       description: Idempotent. Removing a product that is not there succeeds.
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: The cart after the change.
           content:
@@ -192,6 +210,10 @@ paths:
             schema:
               $ref: "#/components/schemas/CheckoutRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "201":
           description: The order was created.
           content:
@@ -257,6 +279,22 @@ components:
         pattern: "^[A-Za-z0-9._-]{1,64}$"
         example: cust_ada
   responses:
+    Unauthenticated:
+      description: |
+        `unauthenticated` (401): the service requires the gateway's signed identity
+        and the request has none, or the one it has is invalid or expired.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: |
+        `forbidden` (403): the signed-in customer is not the customer this request
+        is about.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
     MalformedBody:
       description: The body is not valid JSON, has unknown fields, or has trailing data.
       content:
@@ -275,6 +313,18 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+  securitySchemes:
+    identity:
+      type: apiKey
+      in: header
+      name: X-Gocart-Identity
+      description: |
+        A short-lived signed assertion of who is asking, made by the web gateway
+        after a customer signs in (`v1.<payload>.<HMAC-SHA256 signature>`). Services
+        verify it with the shared `IDENTITY_SECRET`. With `REQUIRE_IDENTITY=true`
+        (compose and Kubernetes) customer routes refuse requests without it;
+        without that flag a request with no assertion is treated as trusted local
+        use, but a *bad* assertion is still refused.
   schemas:
     Cart:
       type: object

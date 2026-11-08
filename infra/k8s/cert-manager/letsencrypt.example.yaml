@@ -1,0 +1,27 @@
+# For a real host with a public DNS name that reaches your ingress. Not applied
+# by anything here: copy it, set your email, apply it, and change the
+# issuerRef in edge/edge.yaml to match.
+# Try letsencrypt-staging first; production has strict limits on failures.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef: { name: letsencrypt-staging-account }
+    solvers:
+      - http01: { ingress: { ingressClassName: traefik } }
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef: { name: letsencrypt-prod-account }
+    solvers:
+      - http01: { ingress: { ingressClassName: traefik } }

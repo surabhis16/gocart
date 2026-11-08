@@ -10,11 +10,19 @@ name: gocart
 # It is a demo default; a real deployment injects a secret, never a literal.
 x-admin: &admin-key ${ADMIN_KEY:-dev-admin-key}
 
-x-version: &version ${VERSION:-0.4.0}
+# Who is signed in is decided by Dex (an OpenID Connect provider; what it offers
+# is set in .env, see .env.example); the web gateway vouches for people to the Order and
+# Cart services with a signed header made from IDENTITY_SECRET. These are demo
+# defaults too: inject real ones, never literals, outside your own machine.
+x-identity: &identity-secret ${IDENTITY_SECRET:-dev-identity-secret-change-me-0123456789}
+x-session: &session-secret ${SESSION_SECRET:-dev-session-secret-change-me-0123456789}
+x-oidc-client: &oidc-client-secret ${OIDC_CLIENT_SECRET:-dev-oidc-client-secret}
+
+x-version: &version ${VERSION:-0.5.0}
 
 services:
   product-service:
-    image: gocart/product-service:${VERSION:-0.4.0}
+    image: gocart/product-service:${VERSION:-0.5.0}
     build:
       context: ./product-service
       args:
@@ -29,7 +37,7 @@ services:
     # Each service owns its data: there is no database both can reach.
 
   order-service:
-    image: gocart/order-service:${VERSION:-0.4.0}
+    image: gocart/order-service:${VERSION:-0.5.0}
     build:
       context: ./order-service
       args:
@@ -40,6 +48,8 @@ services:
       RECONCILE_INTERVAL: 5s
       PAYMENT_TTL: ${PAYMENT_TTL:-15m} # how long stock is held for an unpaid order
       ADMIN_KEY: *admin-key
+      IDENTITY_SECRET: *identity-secret
+      REQUIRE_IDENTITY: "true" # no signed identity, no customer routes
     ports:
       - "8081:8081"
     volumes:
@@ -52,7 +62,7 @@ services:
     restart: unless-stopped
 
   cart-service:
-    image: gocart/cart-service:${VERSION:-0.4.0}
+    image: gocart/cart-service:${VERSION:-0.5.0}
     build:
       context: ./cart-service
       args:
@@ -60,6 +70,8 @@ services:
     environment:
       PRODUCT_URL: http://product-service:8080
       ORDER_URL: http://order-service:8081
+      IDENTITY_SECRET: *identity-secret
+      REQUIRE_IDENTITY: "true"
     ports:
       - "8083:8083"
     volumes:
@@ -72,7 +84,7 @@ services:
     restart: unless-stopped
 
   web-service:
-    image: gocart/web-service:${VERSION:-0.4.0}
+    image: gocart/web-service:${VERSION:-0.5.0}
     build:
       context: ./web-service
       args:
@@ -82,15 +94,48 @@ services:
       ORDER_URL: http://order-service:8081
       PAYMENT_URL: http://payment-service:8082
       CART_URL: http://cart-service:8083
+      ADMIN_KEY: *admin-key # only the gateway holds it, and adds it for signed-in administrators
+      IDENTITY_SECRET: *identity-secret
+      SESSION_SECRET: *session-secret
+      PUBLIC_URL: http://localhost:3000
+      OIDC_ISSUER: http://localhost:5556/dex # what the browser is sent to
+      OIDC_BACKCHANNEL_URL: http://dex:5556/dex # how the gateway itself reaches Dex
+      OIDC_CLIENT_SECRET: *oidc-client-secret
+      ADMIN_EMAILS: ${ADMIN_EMAILS-admin@gocart.test} # comma-separated; with Google or GitHub, put your own email here
+      SIGNIN_HINT: ${SIGNIN_HINT-Demo accounts user1@gocart.test, user2@gocart.test and admin@gocart.test, password gocart-demo} # set it empty to hide the line
     ports:
       - "3000:3000"
     depends_on:
       cart-service:
         condition: service_healthy # start-up order only; the gateway reports any service that is down and keeps serving
+      dex:
+        condition: service_started # the gateway finds Dex on first sign-in, so this is only a courtesy
+    restart: unless-stopped
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    environment:
+      DEX_ISSUER: http://localhost:5556/dex
+      GOCART_REDIRECT_URI: http://localhost:3000/auth/callback
+      GOCART_CLIENT_SECRET: *oidc-client-secret
+      # Sign-in methods, each on when its values are set in .env. The demo accounts are on
+      # by default so a first run needs no setup; set DEX_DEMO_USERS=false once you use Google or GitHub.
+      DEX_DEMO_USERS: ${DEX_DEMO_USERS:-true}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+    ports:
+      - "5556:5556"
+    volumes:
+      # Shared with Kubernetes: one config and one theme for both.
+      - ./infra/k8s/base/dex/config.yaml:/etc/dex/config.yaml:ro
+      - ./infra/k8s/base/dex/theme:/srv/dex/web/themes/gocart:ro
     restart: unless-stopped
 
   payment-service:
-    image: gocart/payment-service:${VERSION:-0.4.0}
+    image: gocart/payment-service:${VERSION:-0.5.0}
     build:
       context: ./payment-service
       args:

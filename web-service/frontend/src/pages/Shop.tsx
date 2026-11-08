@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
 import { useCart, useProducts, useRemoveItem, useSetItem } from "../api/hooks";
-import { ErrorNote, Loading, PageTitle, EmptyState } from "../components/ui";
+import { ErrorNote, Loading, PageTitle, EmptyState, Notice } from "../components/ui";
 import { ProductCard } from "../components/ProductCard";
 import { activeLines } from "../lib/cart";
-import { useCustomerId } from "../lib/identity";
+import { signInUrl, useMe } from "../lib/identity";
 
 export function Shop() {
-  const customer = useCustomerId();
+  const me = useMe();
+  const customer = me.data?.signed_in ? me.data.customer_id : "";
   const products = useProducts();
   const cart = useCart(customer);
   const setItem = useSetItem(customer);
@@ -24,8 +25,10 @@ export function Shop() {
   if (products.isPending) return <Loading label="Loading the catalogue" />;
   if (products.isError) return <ErrorNote error={products.error} onRetry={() => products.refetch()} />;
 
+  // Browsing needs no account; the first attempt to buy asks for one.
+  const signedOut = me.isSuccess && !me.data.signed_in;
   const change = (productId: string, quantity: number) =>
-    quantity <= 0 ? removeItem.mutate(productId) : setItem.mutate({ productId, quantity });
+    signedOut ? window.location.assign(signInUrl("/shop")) : quantity <= 0 ? removeItem.mutate(productId) : setItem.mutate({ productId, quantity });
   const failure = setItem.error ?? removeItem.error;
 
   return (
@@ -40,6 +43,13 @@ export function Shop() {
           className="input !w-64"
         />
       </PageTitle>
+      {signedOut && (
+        <div className="mb-6">
+          <Notice tone="info" title="You are browsing without an account">
+            Everything here is visible to anyone. <a href={signInUrl("/shop")} className="font-semibold text-brand underline">Sign in</a> to add things to a cart.
+          </Notice>
+        </div>
+      )}
       {failure && (
         <div className="mb-4">
           <ErrorNote error={failure} />

@@ -38,10 +38,10 @@ The look is a price tag and a till receipt: concrete-grey canvas, paper panels, 
 1. **Checkout can end five ways, and they are different.** `declined` and `rejected` are definite (nothing charged, cart kept). `unknown` means no answer: say so, never say "failed", and offer a retry (safe, the key is derived from the cart). `pending` and `placed` go to the order page. `lib/checkout.ts` and its tests are the single place this is decided.
 2. **Never do arithmetic on floats.** Prices are integer paise; `formatMoney` is the only formatter.
 3. **The cart has no prices.** The total shown on the cart page is an estimate from the catalogue and is labelled so; the receipt shows what was actually quoted.
-4. **The admin key is memory only.** Do not put it in localStorage, a URL or a log.
+4. **The browser holds no secret and no identity.** Who you are comes from `GET /api/me` (a signed `HttpOnly` cookie the page cannot read); the customer id is never typed, stored or sent by the page. Do not put an id, token or key in localStorage, a URL or a log. A `401` from any call signs the page out (`main.tsx`); changing requests carry `X-Requested-With` (`api/client.ts`).
 5. **The gateway is an allow-list.** A new screen that needs a new route needs that route added to `web-service/internal/httpapi/server.go` and to the service's OpenAPI file; a test fails otherwise.
 6. **A checked-out cart is shown as empty** (`activeLines`), because the backend keeps it frozen so a repeated checkout can be answered.
 
 ## Obvious next steps
 
-Product photos and a product detail page; saved customer identity (a real login needs auth in the services first, see Known limits in `docs/architecture.md`); order filtering and search for admins; toasts for admin actions; a proper empty/illustrated state per page; Playwright tests against `docker compose`.
+Product photos and a product detail page; order filtering and search for admins; toasts for admin actions; a proper empty/illustrated state per page; Playwright tests against `docker compose`.

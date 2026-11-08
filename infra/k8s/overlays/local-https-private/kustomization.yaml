@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../local-https
+secretGenerator:
+  - name: gocart-auth
+    behavior: merge
+    envs:
+      - secrets.env
+configMapGenerator:
+  - name: gocart-public
+    behavior: merge
+    envs:
+      - public.env

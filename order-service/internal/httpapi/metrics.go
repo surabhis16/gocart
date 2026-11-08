@@ -262,6 +262,14 @@ type Option func(*Server)
 // WithAdminKey sets the key that admin operations require.
 func WithAdminKey(key string) Option { return func(s *Server) { s.adminKey = key } }
 
+// WithIdentity makes the server verify the gateway's signed identity assertion
+// with secret. With require set, a request that carries no assertion is refused
+// on every customer route; without it such requests are treated as trusted
+// local or service-to-service calls (the default, for running one service by hand).
+func WithIdentity(secret []byte, require bool) Option {
+	return func(s *Server) { s.identitySecret, s.requireIdentity = secret, require }
+}
+
 // WithVersion labels gocart_build_info.
 func WithVersion(v string) Option { return func(s *Server) { s.metrics.version = v } }
 

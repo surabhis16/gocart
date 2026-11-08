@@ -1,5 +1,4 @@
 import type { Problem } from "./types";
-import { getAdminKey } from "../lib/adminKey";
 
 /** What went wrong, in the terms the screens care about. */
 export class ApiError extends Error {
@@ -42,8 +41,6 @@ interface Options {
   method?: string;
   body?: unknown;
   headers?: Record<string, string>;
-  /** Send the admin key, if one has been entered. */
-  admin?: boolean;
   signal?: AbortSignal;
 }
 
@@ -55,8 +52,9 @@ interface Options {
 export async function requestRaw<T = unknown>(path: string, o: Options = {}): Promise<RawResponse<T>> {
   const headers: Record<string, string> = { Accept: "application/json", ...o.headers };
   if (o.body !== undefined) headers["Content-Type"] = "application/json";
-  const key = o.admin ? getAdminKey() : "";
-  if (key) headers.Authorization = `Bearer ${key}`;
+  // Marks the call as this app's own. The gateway refuses state-changing calls
+  // without it, which is what stops another website from making them.
+  headers["X-Requested-With"] = "gocart";
 
   let res: Response;
   try {
@@ -95,4 +93,10 @@ export function toError(res: RawResponse): ApiError {
   const isProblem = p && typeof p === "object" && typeof p.type === "string";
   const message = isProblem ? (p.detail ?? p.title ?? `Request failed (${res.status})`) : `Request failed (${res.status})`;
   return new ApiError(message, res.status, isProblem ? p : undefined, res.requestId);
+}
+
+/** Ends the session. It lives outside /api because the gateway, not a service, owns it. */
+export async function signOut(): Promise<void> {
+  const res = await fetch("/auth/logout", { method: "POST", headers: { "X-Requested-With": "gocart" } });
+  if (!res.ok) throw new ApiError("Could not sign out.", res.status);
 }

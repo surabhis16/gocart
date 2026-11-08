@@ -4,13 +4,16 @@
 // The browser talks to one address. Without this, it would need to know four
 // service URLs and every service would need CORS rules.
 //
-// The gateway is deliberately dull. It holds no secrets and makes no decisions:
-// the admin key travels from the browser to the service that checks it, and
-// every error the services give comes back unchanged. The only things it adds
-// are a request ID, a 502 problem when a service is unreachable, and an
-// allow-list: a route not listed here does not exist, so the endpoints that
-// exist only for service-to-service calls (reserving stock, creating charges)
-// cannot be reached from a browser.
+// The gateway is where people sign in (OpenID Connect, see auth.go). Behind it
+// the services do their own checking: for every request it forwards, the
+// gateway attaches a short-lived signed statement of who the caller is, and
+// the Order and Cart services only let customers touch their own data. Admin
+// operations are only forwarded for administrators, with the admin key the
+// browser never sees. Every error the services give comes back unchanged. The
+// other things it adds are a request ID, a 502 problem when a service is
+// unreachable, and an allow-list: a route not listed here does not exist, so
+// the endpoints that exist only for service-to-service calls (reserving stock,
+// creating charges) cannot be reached from a browser.
 package httpapi
 
 import (
@@ -44,6 +47,7 @@ type Server struct {
 	metrics *metrics
 	routes  []route
 	client  *http.Client
+	auth    Auth
 }
 
 // New builds the gateway. ui is the built front end; it may be empty.
@@ -52,6 +56,9 @@ func New(up Upstreams, ui fs.FS, log *slog.Logger, opts ...Option) (*Server, err
 		client: &http.Client{Timeout: 1500 * time.Millisecond}}
 	for _, o := range opts {
 		o(s)
+	}
+	if err := s.auth.check(); err != nil {
+		return nil, err
 	}
 	product, err := s.proxy(up.Product, "product-service")
 	if err != nil {
@@ -70,31 +77,39 @@ func New(up Upstreams, ui fs.FS, log *slog.Logger, opts ...Option) (*Server, err
 		return nil, err
 	}
 
+	// Who may call what: public needs nothing, user needs a signed-in session,
+	// admin needs a session whose person is an administrator.
+	g := s.guard
 	s.routes = []route{
 		{"GET /healthz", s.health},
 		{"GET /metrics", s.serveMetrics},
-		{"GET /api/status", s.status},
 
-		{"GET /api/products", product},
-		{"POST /api/products", product},
-		{"GET /api/products/{id}", product},
-		{"PUT /api/products/{id}/stock", product},
+		{"GET /auth/login", s.login},
+		{"GET /auth/callback", s.callback},
+		{"POST /auth/logout", s.logout},
+		{"GET /api/me", s.me},
+		{"GET /api/status", g(admin, s.status)},
 
-		{"POST /api/orders", order},
-		{"GET /api/orders", order},
-		{"GET /api/orders/{id}", order},
-		{"GET /api/orders/{id}/events", order},
-		{"POST /api/orders/{id}/cancel", order},
-		{"POST /api/orders/{id}/ship", order},
-		{"POST /api/orders/{id}/deliver", order},
+		{"GET /api/products", g(public, product)},
+		{"POST /api/products", g(admin, product)},
+		{"GET /api/products/{id}", g(public, product)},
+		{"PUT /api/products/{id}/stock", g(admin, product)},
 
-		{"GET /api/carts/{customer_id}", cart},
-		{"DELETE /api/carts/{customer_id}", cart},
-		{"PUT /api/carts/{customer_id}/items/{product_id}", cart},
-		{"DELETE /api/carts/{customer_id}/items/{product_id}", cart},
-		{"POST /api/carts/{customer_id}/checkout", cart},
+		{"POST /api/orders", g(user, order)},
+		{"GET /api/orders", g(user, order)},
+		{"GET /api/orders/{id}", g(user, order)},
+		{"GET /api/orders/{id}/events", g(admin, order)},
+		{"POST /api/orders/{id}/cancel", g(user, order)},
+		{"POST /api/orders/{id}/ship", g(admin, order)},
+		{"POST /api/orders/{id}/deliver", g(admin, order)},
 
-		{"GET /api/charges/{order_id}", payment},
+		{"GET /api/carts/{customer_id}", g(user, cart)},
+		{"DELETE /api/carts/{customer_id}", g(user, cart)},
+		{"PUT /api/carts/{customer_id}/items/{product_id}", g(user, cart)},
+		{"DELETE /api/carts/{customer_id}/items/{product_id}", g(user, cart)},
+		{"POST /api/carts/{customer_id}/checkout", g(user, cart)},
+
+		{"GET /api/charges/{order_id}", g(admin, payment)},
 
 		{"/api/", s.noSuchAPI},
 		{"/", s.app},
@@ -153,6 +168,7 @@ func (s *Server) proxy(base, name string) (http.HandlerFunc, error) {
 			if id := reqid.From(pr.In.Context()); id != "" {
 				pr.Out.Header.Set(reqid.Header, id)
 			}
+			s.vouch(pr)
 		},
 		Transport: &http.Transport{
 			DialContext:           (&dialer{timeout: 3 * time.Second}).dial,

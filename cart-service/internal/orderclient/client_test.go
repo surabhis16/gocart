@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"gocart/cart-service/internal/cart"
+	"gocart/cart-service/internal/identity"
 	"gocart/cart-service/internal/reqid"
 )
 
@@ -91,5 +92,30 @@ func TestSuccessWithoutAnOrderIdIsNotTrusted(t *testing.T) {
 	_, err := serve(t, 201, `{"status":"confirmed"}`).Place(context.Background(), "k", "c", "tok_visa", lines)
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestTheShoppersIdentityIsPassedOn(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(identity.Header)
+		w.WriteHeader(201)
+		w.Write([]byte(`{"id":"ord_1"}`))
+	}))
+	defer srv.Close()
+
+	ctx := identity.With(context.Background(), identity.Claims{Sub: "c"}, "v1.assertion.sig")
+	if _, err := New(srv.URL, nil).Place(ctx, "k", "c", "tok_visa", lines); err != nil {
+		t.Fatal(err)
+	}
+	if got != "v1.assertion.sig" {
+		t.Errorf("identity header = %q", got)
+	}
+	got = "unset"
+	if _, err := New(srv.URL, nil).Place(context.Background(), "k", "c", "tok_visa", lines); err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Errorf("an anonymous call sent an identity header: %q", got)
 	}
 }

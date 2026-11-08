@@ -23,6 +23,12 @@ WEB="${WEB:-http://localhost:3000}"
 # Must match the ADMIN_KEY the services were started with (compose defaults to this).
 ADMIN_KEY="${ADMIN_KEY:-dev-admin-key}"
 ADMIN=(-H "Authorization: Bearer $ADMIN_KEY")
+# The Order and Cart services only answer a customer who comes with the gateway's
+# signed identity (REQUIRE_IDENTITY). Compose and the Kubernetes overlays use these
+# demo secrets; set IDENTITY_SECRET= (empty) to test services that run without them.
+IDENTITY_SECRET="${IDENTITY_SECRET-dev-identity-secret-change-me-0123456789}"
+SESSION_SECRET="${SESSION_SECRET-dev-session-secret-change-me-0123456789}"
+WHO=""   # the customer the following requests are made as; set before each part
 RUN="$(date +%s)"   # makes this run's keys and customers its own, so it can be repeated
 
 pass=0
@@ -33,7 +39,11 @@ status=""
 req() { # method url [json-body] [extra curl args...]
   local method=$1 url=$2 data=${3:-}
   shift 3 || shift $#
-  local out
+  local out who=()
+  if [ -n "$WHO" ] && [ -n "$IDENTITY_SECRET" ] && [[ "$url" == "$ORDER"* || "$url" == "$CART"* ]]; then
+    who=(-H "X-Gocart-Identity: $(./scripts/mint.py identity "$IDENTITY_SECRET" "$WHO")")
+  fi
+  set -- ${who[@]+"${who[@]}"} "$@"
   if [ -n "$data" ]; then
     out=$(curl -sS -X "$method" -H 'Content-Type: application/json' -d "$data" -w $'\n%{http_code}' "$@" "$url")
   else
@@ -68,6 +78,7 @@ charge_status() { req GET "$PAYMENT/charges/$1" "" "${ADMIN[@]}"; jq_ "d['status
 types() { req GET "$ORDER/orders/$1/events" "" "${ADMIN[@]}"; jq_ "','.join(e['type'] for e in d['events'])"; }
 
 echo
+WHO=cust_smoke
 echo "Place an order for 2 keyboards and 1 hub"
 keyboards=$(stock prd_keyboard)
 hubs=$(stock prd_hub)
@@ -172,9 +183,10 @@ check "409 Conflict" 409 "$status"
 check "problem type is invalid-state" urn:gocart:problem:invalid-state "$(jq_ "d['type']")"
 
 echo
+WHO=cust_cart_$RUN
 echo "Cart and checkout: a declined card keeps the cart, a retried checkout makes one order"
 # A product made for this run (5 in stock), so the sold items never drain the demo catalogue.
-req POST "$PRODUCT/products" '{"name":"Smoke widget","price_minor":10000,"stock":5}' "${ADMIN[@]}"
+req POST "$PRODUCT/products" '{"name":"iPad","price_minor":10000,"stock":5}' "${ADMIN[@]}"
 check "an admin can create a product" 201 "$status"
 widget=$(jq_ "d['id']")
 req GET "$CART/carts/cust_cart_$RUN" ""
@@ -232,10 +244,55 @@ check "stock reservations are not reachable from a browser (404)" 404 "$status"
 req POST "$WEB/api/charges" '{"order_id":"x","amount_minor":1}'
 check "creating a charge is not reachable from a browser (404)" 404 "$status"
 req GET "$WEB/api/status" ""
-check "the gateway reports on every service" 4 "$(jq_ "len([s for s in d['services'] if s['up']])")"
+check "the status page needs an administrator (401 when signed out)" 401 "$status"
 req GET "$WEB/api/carts/cust_cart_$RUN" ""
-check "a cart reads through the gateway" 200 "$status"
-check "and is the same cart the Cart service holds" "$cart_order" "$(jq_ "d['order_id']")"
+check "a cart needs a sign-in (401)" 401 "$status"
+req GET "$WEB/api/me" ""
+check "/api/me says nobody is signed in" False "$(jq_ "d['signed_in']")"
+req POST "$WEB/api/orders" '{"customer_id":"cust_x"}' -H "X-Requested-With: gocart"
+check "placing an order needs a sign-in (401)" 401 "$status"
+req GET "$WEB/api/carts/cust_cart_$RUN" "" -H "X-Gocart-Identity: forged" -H "Authorization: Bearer $ADMIN_KEY"
+check "a browser cannot smuggle in an identity or the admin key (401)" 401 "$status"
+
+if [ -n "$IDENTITY_SECRET" ] && [ -n "$SESSION_SECRET" ]; then
+  echo
+  echo "Signed in through the gateway (a session made with the demo secrets)"
+  cookie() { printf 'gocart_session=%s' "$(./scripts/mint.py session "$SESSION_SECRET" "$1" ${2:+admin})"; }
+  req GET "$WEB/api/carts/cust_cart_$RUN" "" -H "Cookie: $(cookie "cust_cart_$RUN")"
+  check "the owner reads their cart" 200 "$status"
+  check "and it is the same cart the Cart service holds" "$cart_order" "$(jq_ "d['order_id']")"
+  req GET "$WEB/api/carts/cust_cart_$RUN" "" -H "Cookie: $(cookie cust_stranger)"
+  check "someone else is refused (403)" 403 "$status"
+  req GET "$WEB/api/orders/$cart_order" "" -H "Cookie: $(cookie cust_stranger)"
+  check "someone else cannot see the order (404, as if it did not exist)" 404 "$status"
+  req GET "$WEB/api/orders/$cart_order" "" -H "Cookie: $(cookie "cust_cart_$RUN")"
+  check "the owner sees their order" 200 "$status"
+  req GET "$WEB/api/status" "" -H "Cookie: $(cookie "cust_cart_$RUN")"
+  check "a customer cannot open the status page (403)" 403 "$status"
+  req GET "$WEB/api/status" "" -H "Cookie: $(cookie boss admin)"
+  check "an administrator can, and every service is up" 4 "$(jq_ "len([s for s in d['services'] if s['up']])")"
+  req GET "$WEB/api/orders/$cart_order/events" "" -H "Cookie: $(cookie boss admin)"
+  check "an administrator reads any order's history" 200 "$status"
+  req POST "$WEB/api/orders/$cart_order/cancel" '' -H "Cookie: $(cookie "cust_cart_$RUN")"
+  check "a change without the CSRF header is refused (403)" 403 "$status"
+fi
+
+if [ -n "$IDENTITY_SECRET" ] && [ "${REQUIRE_IDENTITY:-true}" = true ]; then
+  echo
+  echo "The services check who is asking, even when called directly"
+  WHO="" req GET "$CART/carts/cust_cart_$RUN" ""
+  check "the Cart service refuses a request with no identity (401)" 401 "$status"
+  WHO="" req GET "$ORDER/orders/$cart_order" ""
+  check "the Order service refuses a request with no identity (401)" 401 "$status"
+  WHO=cust_stranger req GET "$ORDER/orders/$cart_order" ""
+  check "a stranger's lookup finds nothing (404)" 404 "$status"
+  WHO=cust_stranger req GET "$CART/carts/cust_cart_$RUN" ""
+  check "a stranger cannot read the cart (403)" 403 "$status"
+  WHO=cust_stranger req POST "$ORDER/orders" '{"customer_id":"cust_cart_'"$RUN"'","payment_token":"tok_visa","items":[{"product_id":"prd_lamp","quantity":1}]}'
+  check "a stranger cannot place an order in someone's name (403)" 403 "$status"
+  WHO=cust_stranger req GET "$ORDER/orders?customer_id=cust_cart_$RUN" ""
+  check "a stranger cannot list someone's orders (403)" 403 "$status"
+fi
 echo
 echo "One request id follows a request through both services"
 req GET "$ORDER/orders/ord_does_not_exist" "" -H 'X-Request-ID: smoke-trace-1'

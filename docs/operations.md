@@ -119,7 +119,8 @@ The manifests make a few choices on purpose; each is commented in the YAML:
 
 - **One replica each, with a `Recreate` rollout.** State is a file with one writer; see the [limits table](architecture.md#known-limits). The exception is `staging-cassandra`, which runs **two Order replicas** with a `RollingUpdate` (no volume, nothing on disk to protect). They stay consistent through the change feed; tune it with `SYNC_INTERVAL` (default 2s) and `RESYNC_INTERVAL` (default 5m). To see it: `kubectl -n gocart-staging get pods -l app.kubernetes.io/name=order-service`, place orders, and read them back repeatedly: both replicas answer, and `GET /orders/{id}` is always right.
 - **The Order service's readiness probe checks neither the Product nor the Payment service.** If it did, an outage of either would take Order out of rotation, and the whole design is that Order keeps accepting orders during one.
-- **The admin key comes from a Secret**, never from a literal in a Deployment. The `local` and `staging` overlays generate it from a demo value; see [Admin key](#admin-key-and-metrics).
+- **The admin key and the sign-in secrets come from Secrets**, never from a literal in a Deployment. The `local` and `staging` overlays generate them from demo values; see [Admin key](#admin-key-and-metrics) and [Sign-in, secrets and the edge](#sign-in-secrets-and-the-edge).
+- **Only the gateway is reachable, and only through the ingress.** NetworkPolicies deny all inbound traffic, then allow the ingress controller to reach the gateway and Dex, and each service to be reached only by its real callers.
 - **Hardened pods:** non-root, read-only root filesystem, all capabilities dropped, default seccomp profile, resource limits.
 - **Cassandra** is a one-node StatefulSet with a headless Service and a volume claim template.
 
@@ -161,7 +162,7 @@ terraform plan -var offline=true
 
 The plan shows 16 resources to add: 5 repositories, 5 lifecycle policies, 5 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). That is the real output of `terraform plan -var offline=true`.
 
-> **What is verified.** `terraform validate` passes and `terraform plan -var offline=true` produces the 16 additions above, run by the author; CI runs `fmt -check`, `init`, `validate` and `plan` on every push and is green. 
+> **What is verified.** `terraform validate` passes and `terraform plan -var offline=true` produces the 16 additions above, run by the author; CI runs `fmt -check`, `init`, `validate` and `plan` on every push and is green. Applying to real AWS needs an account and `-var offline=false`; that has not been done and nothing here claims the configuration applies cleanly. Free-tier LocalStack was not used, because I could not confirm that its free edition supports ECR.
 
 ### The pipeline
 
@@ -263,6 +264,51 @@ kubectl -n gocart-staging create secret generic gocart-admin --from-literal=admi
 ```
 
 and remove the `secretGenerator` from the overlay so it does not overwrite yours.
+
+### Sign-in, secrets and the edge
+
+Customers sign in through Dex (an OpenID Connect provider) and the gateway vouches for them to the Order and Cart services; how it works is in [architecture.md](architecture.md#who-is-asking-sign-in-and-ownership).
+
+**Compose, first run (no setup).** `docker compose up --build`, open <http://localhost:3000>, press *Sign in*. Dex is on :5556 and, with nothing configured, offers three demo accounts (password `gocart-demo`): `user1@gocart.test`, `user2@gocart.test` and `admin@gocart.test` (the administrator). Sign in as Asha, add to a cart, then as Ravi in a private window: his cart and orders are his own, and her order's address answers `404`.
+
+**Compose, with Google or GitHub.** Dex offers each sign-in method whose settings you give it, in a `.env` file (copy `.env.example`; git ignores `.env`). Creating a customer is automatic: a first sign-in is the sign-up, and the customer id comes from the provider's account id.
+
+1. *Google.* In [Google Cloud Console](https://console.cloud.google.com/apis/credentials) create a project if you have none, configure the OAuth consent screen (External; add yourself as a test user), then Credentials, *Create credentials*, *OAuth client ID*, type *Web application*. Under *Authorized redirect URIs* add `http://localhost:5556/dex/callback`: **Dex's** callback, not the shop's. Copy the client ID and secret into `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+2. *GitHub.* In GitHub, Settings, Developer settings, OAuth Apps, *New OAuth App*. Homepage `http://localhost:3000`, callback `http://localhost:5556/dex/callback`. Put the ID and a generated secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`.
+3. Set `ADMIN_EMAILS` to your own address (the one the provider reports as verified), and `DEX_DEMO_USERS=false` so the published demo password no longer works.
+4. `docker compose up -d --force-recreate dex web-service`. The sign-in page now lists the methods you configured. With a single method, pressing *Sign in* goes straight to it.
+
+If a method you set up is missing, `docker compose logs dex` says which variable is empty. The login pages are styled by `infra/k8s/base/dex/theme` (the same theme files compose and Kubernetes both use).
+
+**Kubernetes with HTTPS.** Traefik (the ingress controller; the older community ingress-nginx was retired in March 2026) and cert-manager are installed once per cluster, then the `local-https` overlay adds the front door. Helm is used only for Traefik's own install; nothing of GoCart needs it.
+
+```
+helm repo add traefik https://traefik.github.io/charts && helm repo update
+helm install traefik traefik/traefik -n traefik --create-namespace   # note the version it installs, then pin it with --version
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+kubectl apply -f infra/k8s/cert-manager/clusterissuers.yaml          # once cert-manager's pods are Ready
+kubectl apply -k infra/k8s/overlays/local-https
+kubectl -n traefik port-forward svc/traefik 8443:443
+```
+
+Then open <https://gocart.localtest.me:8443> (that name always resolves to 127.0.0.1; the browser warns once about the self-signed certificate). The shop must be opened at this address: the gateway's `PUBLIC_URL`, Dex's issuer and redirect URI, and the route's host have to agree, and `check-k8s.py` fails if they do not. The plain `local` and `staging` overlays have no front door: they are for `ship.sh` and `smoke.sh`, which call the services directly. Port-forwarding to the `web-service` Service serves the pages there, but sign-in cannot complete, because the browser is sent to the public address.
+
+Traefik rate-limits each client address (a steady 20 requests a second with bursts to 60, and 2 a second with bursts to 10 on `/auth/`; see `infra/k8s/edge/edge.yaml`) and caps request bodies at 64 KiB. To try it: `for i in $(seq 60); do curl -sk -o /dev/null -w '%{http_code} ' https://gocart.localtest.me:8443/auth/login; done` and watch `429` appear.
+
+**Google and GitHub on Kubernetes.** Same two registrations, but with your public address: the callback is `https://<your host>/dex/callback`. Add the four values to the `gocart-auth` Secret under the keys `google-client-id`, `google-client-secret`, `github-client-id`, `github-client-secret` (Dex starts offering each method as soon as its pair exists; restart the `dex` Deployment), and set `admin-emails` in `gocart-public` to your address. The `local` and `staging` overlays are demos: they switch the throwaway accounts on (`dex-demo-users=true`) and name `admin@gocart.test` the administrator, which you would remove for a real deployment.
+
+**Secrets.** Three values sign and verify: `IDENTITY_SECRET` (shared by the gateway, Order and Cart; at least 32 characters, or the service refuses to start), `SESSION_SECRET` (the gateway only) and `OIDC_CLIENT_SECRET` (the gateway and Dex). The demo values are literals in compose and the overlays. For anything real:
+
+```
+kubectl -n gocart-staging create secret generic gocart-auth \
+  --from-literal=identity-secret="$(openssl rand -hex 32)" \
+  --from-literal=session-secret="$(openssl rand -hex 32)" \
+  --from-literal=oidc-client-secret="$(openssl rand -hex 24)" --dry-run=client -o yaml | kubectl apply -f -
+```
+
+and remove the `gocart-auth` generator from the overlay. Changing `SESSION_SECRET` signs everyone out; changing `IDENTITY_SECRET` needs the gateway, Order and Cart restarted together. **Real use** means turning the demo accounts off and signing in through Google or GitHub (above), or pointing the gateway at another OIDC provider directly (set `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `ADMIN_EMAILS`), a real hostname with `letsencrypt.example.yaml` in place of the self-signed issuer, and keeping the secrets in an external store rather than in the overlay.
+
+**Calling the services by hand** (for debugging) now needs an identity: `scripts/mint.py identity "$IDENTITY_SECRET" cust_x` prints the header value to send as `X-Gocart-Identity`. `smoke.sh` does this for you; set `IDENTITY_SECRET=` (empty) to run it against services started without sign-in.
 
 ### Metrics
 

@@ -1,0 +1,93 @@
+# Dex: the OpenID Connect provider people sign in with. It stands in for a real
+# one (Google, Entra ID, Keycloak): GoCart only knows an issuer, a client id and
+# a secret, so moving to a real provider is a change of those values, not of code.
+# What it offers (Google, GitHub, demo accounts) is switched on by environment
+# variables read by dex/config.yaml, which the image renders at start-up; the look
+# is dex/theme. Sessions are kept in memory, so there is one replica and a restart
+# just asks people to sign in again.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dex
+  labels:
+    app.kubernetes.io/name: dex
+    app.kubernetes.io/component: identity
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dex
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dex
+        app.kubernetes.io/component: identity
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dex
+          image: ghcr.io/dexidp/dex:v2.41.1
+          args: ["dex", "serve", "/etc/dex/config.yaml"]
+          ports:
+            - name: http
+              containerPort: 5556
+            - name: telemetry
+              containerPort: 5558
+          env:
+            - { name: GOCART_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: oidc-client-secret } } }
+            - { name: PUBLIC_URL, valueFrom: { configMapKeyRef: { name: gocart-public, key: public-url } } }
+            - { name: DEX_ISSUER, valueFrom: { configMapKeyRef: { name: gocart-public, key: oidc-issuer } } }
+            - { name: GOCART_REDIRECT_URI, value: "$(PUBLIC_URL)/auth/callback" }
+            - { name: DEX_DEMO_USERS, valueFrom: { configMapKeyRef: { name: gocart-public, key: dex-demo-users } } }
+            # Real sign-in methods: on when these keys exist in the gocart-auth Secret (docs/operations.md).
+            - { name: GOOGLE_CLIENT_ID, valueFrom: { secretKeyRef: { name: gocart-auth, key: google-client-id, optional: true } } }
+            - { name: GOOGLE_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: google-client-secret, optional: true } } }
+            - { name: GITHUB_CLIENT_ID, valueFrom: { secretKeyRef: { name: gocart-auth, key: github-client-id, optional: true } } }
+            - { name: GITHUB_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: github-client-secret, optional: true } } }
+          readinessProbe:
+            httpGet: { path: /healthz/ready, port: telemetry }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz/live, port: telemetry }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          volumeMounts:
+            - { name: config, mountPath: /etc/dex, readOnly: true }
+            - { name: theme, mountPath: /srv/dex/web/themes/gocart, readOnly: true }
+            - { name: tmp, mountPath: /tmp } # the image renders the config template into /tmp at start-up
+          resources:
+            requests: { cpu: 25m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: config
+          configMap:
+            name: dex-config
+        - name: theme
+          configMap:
+            name: dex-theme
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 8Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex
+  labels:
+    app.kubernetes.io/name: dex
+spec:
+  selector:
+    app.kubernetes.io/name: dex
+  ports:
+    - { name: http, port: 5556, targetPort: http }

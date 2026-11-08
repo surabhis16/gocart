@@ -1,0 +1,65 @@
+# gocart.localtest.me is a public name that always resolves to 127.0.0.1, so a
+# local cluster needs no hosts-file edit. Use your own name for a real deployment
+# (and change it in base/ as well; see base/kustomization.yaml).
+#
+# These are Traefik and cert-manager objects (CRDs), so they live in their own
+# layer: a cluster without those two installed can still apply every other overlay.
+#
+# Rate limits are per client address. Behind a cloud load balancer every request
+# arrives from the balancer, so there set ipStrategy.depth to read the real client
+# from X-Forwarded-For, or the whole shop shares one bucket.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gocart-tls
+spec:
+  secretName: gocart-tls
+  dnsNames: [gocart.localtest.me]
+  issuerRef:
+    kind: ClusterIssuer
+    name: gocart-selfsigned # letsencrypt-staging/prod for a real host
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gocart-limit
+spec:
+  rateLimit: { average: 20, period: 1s, burst: 60 }
+---
+# /auth/ is the sign-in handshake, which a password-guesser would hammer.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gocart-limit-signin
+spec:
+  rateLimit: { average: 2, period: 1s, burst: 10 }
+---
+# The largest request body anywhere in the shop is a small JSON document.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gocart-small-bodies
+spec:
+  buffering: { maxRequestBodyBytes: 65536 }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: gocart
+spec:
+  entryPoints: [websecure]
+  routes:
+    - kind: Rule
+      match: Host(`gocart.localtest.me`) && PathPrefix(`/dex`)
+      middlewares: [{ name: gocart-limit }, { name: gocart-small-bodies }]
+      services: [{ name: dex, port: http }]
+    - kind: Rule
+      match: Host(`gocart.localtest.me`) && PathPrefix(`/auth`)
+      middlewares: [{ name: gocart-limit-signin }, { name: gocart-small-bodies }]
+      services: [{ name: web-service, port: http }]
+    - kind: Rule
+      match: Host(`gocart.localtest.me`)
+      middlewares: [{ name: gocart-limit }, { name: gocart-small-bodies }]
+      services: [{ name: web-service, port: http }]
+  tls:
+    secretName: gocart-tls

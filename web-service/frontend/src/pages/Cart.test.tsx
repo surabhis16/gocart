@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CartPage } from "./Cart";
+import { SignedInProvider } from "../lib/identity";
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -28,12 +29,14 @@ function open() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={["/cart"]}>
-        <Routes>
-          <Route path="/cart" element={<CartPage />} />
-          <Route path="/orders/:id" element={<p>receipt page</p>} />
-        </Routes>
-      </MemoryRouter>
+      <SignedInProvider value={{ signed_in: true, customer_id: "cust_test", name: "Test", email: "t@gocart.test", role: "customer" }}>
+        <MemoryRouter initialEntries={["/cart"]}>
+          <Routes>
+            <Route path="/cart" element={<CartPage />} />
+            <Route path="/orders/:id" element={<p>receipt page</p>} />
+          </Routes>
+        </MemoryRouter>
+      </SignedInProvider>
     </QueryClientProvider>,
   );
 }

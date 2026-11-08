@@ -1,0 +1,78 @@
+{{- /*
+  Dex, the OpenID Connect provider GoCart signs people in with. The Dex image
+  renders this file with gomplate when it starts, so what is switched on comes
+  from the environment and nothing secret is written here.
+
+    DEX_ISSUER             the public address of Dex, e.g. https://gocart.localtest.me:8443/dex
+    GOCART_REDIRECT_URI    where Dex may send people back: <public url>/auth/callback
+    GOCART_CLIENT_SECRET   the gateway's secret (a Secret in Kubernetes, .env in compose)
+
+  Sign-in methods, each on only when its variables are set:
+    GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   "Log in with Google"
+    GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET   "Log in with GitHub"
+    DEX_DEMO_USERS=true                       three throwaway accounts with a published
+                                              password. For a laptop only: never on a shared host.
+  Setting up Google and GitHub is in docs/operations.md.
+*/ -}}
+{{- $demo := eq (getenv "DEX_DEMO_USERS" "false") "true" -}}
+{{- $google := getenv "GOOGLE_CLIENT_ID" -}}
+{{- $github := getenv "GITHUB_CLIENT_ID" -}}
+{{- if not (or $demo $google $github) -}}
+  {{- "" | required "No sign-in method is configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET, or GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET, or DEX_DEMO_USERS=true (docs/operations.md)." -}}
+{{- end -}}
+issuer: {{ getenv "DEX_ISSUER" | required "DEX_ISSUER is not set" }}
+
+storage:
+  type: memory # sessions are forgotten when Dex restarts; people simply sign in again
+
+web:
+  http: 0.0.0.0:5556
+
+telemetry:
+  http: 0.0.0.0:5558
+
+# GoCart's look. The theme is theme/ next to this file, mounted into the image's web directory.
+frontend:
+  dir: /srv/dex/web
+  theme: gocart
+  issuer: GoCart
+
+oauth2:
+  skipApprovalScreen: true
+
+staticClients:
+  - id: gocart-web
+    name: GoCart
+    secretEnv: GOCART_CLIENT_SECRET # from the environment, never written here
+    redirectURIs:
+      - {{ getenv "GOCART_REDIRECT_URI" | required "GOCART_REDIRECT_URI is not set" }}
+{{ if or $google $github }}
+connectors:
+{{- if $google }}
+  - type: google
+    id: google
+    name: Google
+    config:
+      clientID: "{{ $google }}"
+      clientSecret: "{{ getenv "GOOGLE_CLIENT_SECRET" | required "GOOGLE_CLIENT_ID is set but GOOGLE_CLIENT_SECRET is not" }}"
+      redirectURI: {{ getenv "DEX_ISSUER" }}/callback
+{{- end }}
+{{- if $github }}
+  - type: github
+    id: github
+    name: GitHub
+    config:
+      clientID: "{{ $github }}"
+      clientSecret: "{{ getenv "GITHUB_CLIENT_SECRET" | required "GITHUB_CLIENT_ID is set but GITHUB_CLIENT_SECRET is not" }}"
+      redirectURI: {{ getenv "DEX_ISSUER" }}/callback
+{{- end }}
+{{ end }}
+{{- if $demo }}
+# DEMO ACCOUNTS (DEX_DEMO_USERS=true). Password for all three: gocart-demo
+enablePasswordDB: true
+staticPasswords:
+  - { email: user1@gocart.test,  username: User 1,   userID: 6f1b6c1e-0000-4000-8000-000000000001, hash: "$2a$10$2EuOTHrk7cyb5w1c7x8RoeO549Wz9PYcOxvKphudv19HNkqXC5paC" }
+  - { email: user2@gocart.test,  username: User 2,  userID: 6f1b6c1e-0000-4000-8000-000000000002, hash: "$2a$10$2EuOTHrk7cyb5w1c7x8RoeO549Wz9PYcOxvKphudv19HNkqXC5paC" }
+  # The gateway treats this address as the administrator when ADMIN_EMAILS says so.
+  - { email: admin@gocart.test, username: Shop Admin, userID: 6f1b6c1e-0000-4000-8000-000000000003, hash: "$2a$10$2EuOTHrk7cyb5w1c7x8RoeO549Wz9PYcOxvKphudv19HNkqXC5paC" }
+{{- end }}

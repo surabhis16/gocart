@@ -51,7 +51,14 @@ type metrics struct {
 	mu       sync.Mutex
 	requests map[reqKey]uint64
 	latency  map[string]*histogram // by route
+	signins  map[string]uint64     // sign-in attempts, by result
+}
 
+// logins counts a sign-in attempt by how it ended.
+func (m *metrics) logins(result string) {
+	m.mu.Lock()
+	m.signins[result]++
+	m.mu.Unlock()
 }
 
 func newMetrics(service string) *metrics {
@@ -60,6 +67,7 @@ func newMetrics(service string) *metrics {
 		start:    time.Now(),
 		requests: map[reqKey]uint64{},
 		latency:  map[string]*histogram{},
+		signins:  map[string]uint64{},
 	}
 }
 
@@ -165,6 +173,10 @@ func (m *metrics) write(w io.Writer, gauges []Gauge) {
 		routes = append(routes, r)
 		hists[r] = histogram{counts: append([]uint64(nil), h.counts...), sum: h.sum, n: h.n}
 	}
+	logins := make(map[string]uint64, len(m.signins))
+	for k, v := range m.signins {
+		logins[k] = v
+	}
 	m.mu.Unlock()
 	sort.Strings(routes)
 
@@ -172,6 +184,16 @@ func (m *metrics) write(w io.Writer, gauges []Gauge) {
 	fmt.Fprintf(w, "gocart_build_info%s 1\n", labels(map[string]string{"service": m.service, "version": m.version}))
 	fmt.Fprintf(w, "# HELP gocart_uptime_seconds Seconds since the process started.\n# TYPE gocart_uptime_seconds gauge\n")
 	fmt.Fprintf(w, "gocart_uptime_seconds%s %.0f\n", labels(map[string]string{"service": m.service}), time.Since(m.start).Seconds())
+
+	fmt.Fprintf(w, "# HELP gocart_signins_total Sign-in attempts, by how they ended.\n# TYPE gocart_signins_total counter\n")
+	results := make([]string, 0, len(logins))
+	for k := range logins {
+		results = append(results, k)
+	}
+	sort.Strings(results)
+	for _, k := range results {
+		fmt.Fprintf(w, "gocart_signins_total%s %d\n", labels(map[string]string{"service": m.service, "result": k}), logins[k])
+	}
 
 	fmt.Fprintf(w, "# HELP gocart_http_requests_total Requests handled, by route pattern and status.\n# TYPE gocart_http_requests_total counter\n")
 	for i, k := range reqs {

@@ -65,7 +65,7 @@ func newFixture(t *testing.T) *fixture {
 		cart: newBackend(t, 200, `{"items":[]}`), y: newBackend(t, 200, `{"status":"approved"}`),
 	}
 	srv, err := New(Upstreams{Product: f.product.srv.URL, Order: f.order.srv.URL, Cart: f.cart.srv.URL, Payment: f.y.srv.URL},
-		app, slog.New(slog.NewTextHandler(io.Discard, nil)), WithVersion("test"))
+		app, slog.New(slog.NewTextHandler(io.Discard, nil)), WithVersion("test"), WithAuth(testAuth(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,22 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+// do sends a request as a signed-in administrator, the way the app does:
+// with the session cookie and the header that marks it as the app's own call.
+// anon, asCustomer and send are the other ways in.
 func (f *fixture) do(method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+	return f.send(method, path, body, append([]string{"Cookie", f.cookie(true), csrfHeader, csrfValue}, hdr...)...)
+}
+
+func (f *fixture) asCustomer(method, path, body string, hdr ...string) *httptest.ResponseRecorder {
+	return f.send(method, path, body, append([]string{"Cookie", f.cookie(false), csrfHeader, csrfValue}, hdr...)...)
+}
+
+func (f *fixture) anon(method, path, body string) *httptest.ResponseRecorder {
+	return f.send(method, path, body, csrfHeader, csrfValue)
+}
+
+func (f *fixture) send(method, path, body string, hdr ...string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
@@ -140,18 +155,18 @@ func TestInternalEndpointsAreNotReachableFromABrowser(t *testing.T) {
 	}
 }
 
-func TestQueryStringBodyAndAdminKeyAreForwardedUntouched(t *testing.T) {
+func TestQueryStringBodyAndIdempotencyKeyAreForwardedUntouched(t *testing.T) {
 	f := newFixture(t)
 	rec := f.do("POST", "/api/orders/ord_1/ship?x=1&y=a%20b", `{"hello":"world"}`,
-		"Authorization", "Bearer secret", "Idempotency-Key", "k-1", "Content-Type", "application/json")
+		"Idempotency-Key", "k-1", "Content-Type", "application/json")
 	if rec.Code != 201 {
 		t.Fatalf("%d", rec.Code)
 	}
 	if f.order.query != "x=1&y=a%20b" || f.order.body != `{"hello":"world"}` {
 		t.Errorf("query=%q body=%q", f.order.query, f.order.body)
 	}
-	if f.order.headers.Get("Authorization") != "Bearer secret" || f.order.headers.Get("Idempotency-Key") != "k-1" {
-		t.Errorf("the admin key and idempotency key must reach the service: %v", f.order.headers)
+	if f.order.headers.Get("Idempotency-Key") != "k-1" || f.order.headers.Get("Content-Type") != "application/json" {
+		t.Errorf("headers the service needs must reach it: %v", f.order.headers)
 	}
 }
 
@@ -245,7 +260,7 @@ func TestTheAppIsServedWithFallbackAndCaching(t *testing.T) {
 }
 
 func TestAnUnbuiltFrontEndSaysSo(t *testing.T) {
-	srv, _ := New(Upstreams{"http://a:1", "http://b:1", "http://c:1", "http://d:1"}, fstest.MapFS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv, _ := New(Upstreams{"http://a:1", "http://b:1", "http://c:1", "http://d:1"}, fstest.MapFS{}, slog.New(slog.NewTextHandler(io.Discard, nil)), WithAuth(testAuth(t)))
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
 	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "npm run build") {
@@ -265,7 +280,7 @@ func TestSecurityHeadersAreOnEverything(t *testing.T) {
 
 func TestBadUpstreamConfigurationIsRefusedAtStart(t *testing.T) {
 	for _, bad := range []string{"", "order-service:8081", "/just/a/path"} {
-		_, err := New(Upstreams{Product: "http://p:1", Order: bad, Cart: "http://c:1", Payment: "http://y:1"}, app, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		_, err := New(Upstreams{Product: "http://p:1", Order: bad, Cart: "http://c:1", Payment: "http://y:1"}, app, slog.New(slog.NewTextHandler(io.Discard, nil)), WithAuth(testAuth(t)))
 		if err == nil {
 			t.Errorf("%q was accepted", bad)
 		}
@@ -302,7 +317,7 @@ func TestForwardedRoutesExistInTheServiceSpecs(t *testing.T) {
 	f := newFixture(t)
 	for _, r := range f.srv.Routes() {
 		method, p, ok := strings.Cut(r, " ")
-		if !ok || !strings.HasPrefix(p, "/api/") || p == "/api/" || p == "/api/status" {
+		if !ok || !strings.HasPrefix(p, "/api/") || p == "/api/" || p == "/api/status" || p == "/api/me" {
 			continue
 		}
 		upstream := method + " " + strings.TrimPrefix(p, "/api")

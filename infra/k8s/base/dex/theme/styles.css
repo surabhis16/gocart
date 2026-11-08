@@ -1,0 +1,234 @@
+/* GoCart's sign-in pages: the same concrete canvas, paper and bottle-green ink as the
+   shop (web-service/frontend/DESIGN.md), on top of Dex's own markup. Dex loads this
+   after its stock CSS, so it only has to say what is different. The fonts are served
+   from this folder, so the page loads nothing from other sites. */
+
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("bricolage-grotesque.woff2") format("woff2");
+  font-weight: 200 800;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Instrument Sans";
+  src: url("instrument-sans.woff2") format("woff2");
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+:root {
+  --canvas: #e6ebe8;
+  --surface: #f7f9f7;
+  --sunken: #d8e0dc;
+  --ink: #0e2a23;
+  --muted: #4f675f;
+  --line: rgba(14, 42, 35, 0.3);
+  --brand: #d3126f;
+  --brand-ink: #ffffff;
+  --bad: #b3261e;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #0a1512;
+    --surface: #12211c;
+    --sunken: #1b2e28;
+    --ink: #e6efea;
+    --muted: #96afa6;
+    --line: rgba(230, 239, 234, 0.3);
+    --brand: #ff5fa2;
+    --brand-ink: #1a0610;
+    --bad: #ff8278;
+    color-scheme: dark;
+  }
+}
+
+.theme-body {
+  min-height: 100vh;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: "Instrument Sans", system-ui, sans-serif;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The wordmark: the shop's price tag and "gocart", drawn here so it follows light and dark. */
+.theme-navbar {
+  background: transparent;
+  box-shadow: none;
+  height: auto;
+  overflow: visible;
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+}
+.theme-navbar__logo-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: auto;
+  height: auto;
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1rem;
+  overflow: visible;
+  font: 800 1.5rem/1 "Bricolage Grotesque", system-ui, sans-serif;
+  letter-spacing: -0.04em;
+}
+.theme-navbar__logo-wrap::before {
+  content: "";
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: 2px;
+  background:
+    radial-gradient(circle at 0.375rem 0.375rem, var(--canvas) 0 0.1875rem, transparent 0.2rem),
+    var(--brand);
+  clip-path: polygon(0 0, 70% 0, 100% 30%, 100% 100%, 0 100%);
+}
+.theme-navbar__logo-wrap::after {
+  content: "gocart";
+}
+.theme-navbar__logo {
+  display: none;
+}
+
+.dex-container {
+  color: var(--ink); /* Dex's stock CSS sets a fixed dark grey here */
+  margin: 0 auto;
+  padding: 2.5rem 1rem 3rem;
+}
+
+/* The panel is a receipt: paper with a serrated edge, like the order receipts. */
+.theme-panel {
+  --tooth: 9px;
+  margin: 0 auto;
+  max-width: 24rem;
+  padding: calc(var(--tooth) + 1.75rem) 1.75rem;
+  background: var(--surface);
+  box-shadow: none;
+  text-align: left;
+  -webkit-mask:
+    conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(var(--tooth) * 2) 51% repeat-x,
+    conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg) top / calc(var(--tooth) * 2) 51% repeat-x;
+  mask:
+    conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) bottom / calc(var(--tooth) * 2) 51% repeat-x,
+    conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg) top / calc(var(--tooth) * 2) 51% repeat-x;
+}
+.theme-heading {
+  margin: 0 0 1.25rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px dotted var(--line);
+  font: 700 1.5rem/1.15 "Bricolage Grotesque", system-ui, sans-serif;
+  letter-spacing: -0.03em;
+}
+.theme-panel p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.theme-form-row {
+  margin: 1rem 0;
+}
+.theme-form-label,
+.theme-form-input {
+  width: 100%;
+}
+.theme-form-label {
+  margin: 0 0 0.3rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.theme-form-input {
+  height: auto;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: none;
+  color: var(--ink);
+  font: 400 1rem/1.4 "Instrument Sans", system-ui, sans-serif;
+}
+.theme-form-input::placeholder {
+  color: var(--muted);
+}
+.theme-form-input:focus,
+.theme-form-input:active {
+  border-color: var(--ink);
+  outline: 2px solid color-mix(in srgb, var(--brand) 40%, transparent);
+  outline-offset: 1px;
+}
+
+/* One accent: the main action (here, Login) is the tag colour. Other sign-in methods are paper. */
+.dex-btn {
+  border-radius: 6px;
+  box-shadow: none;
+  font-family: "Instrument Sans", system-ui, sans-serif;
+}
+.dex-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+.theme-btn--primary {
+  width: 100%;
+  min-width: 0;
+  padding: 0.65rem 1rem;
+  background: var(--brand);
+  color: var(--brand-ink);
+  font-weight: 700;
+}
+.theme-btn--primary:hover {
+  background: var(--brand);
+  color: var(--brand-ink);
+  filter: brightness(0.93);
+}
+.theme-panel a {
+  text-decoration: none;
+}
+.theme-btn-provider {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+}
+.theme-btn-provider:hover {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+.dex-btn-icon {
+  border-radius: 0;
+  border-right: 1px solid var(--line);
+  margin-right: 0.5rem;
+}
+.dex-btn-icon--local {
+  background-color: var(--ink);
+}
+.dex-btn-text {
+  font-weight: 600;
+}
+
+.dex-error-box {
+  max-width: none;
+  margin: 1rem 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--bad);
+  font-weight: 600;
+  text-align: left;
+}
+.theme-link-back {
+  margin-top: 1rem;
+}
+.dex-subtle-text {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+.theme-link-back a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gocart/cart-service/internal/cart"
+	"gocart/cart-service/internal/identity"
 	"gocart/cart-service/internal/reqid"
 )
 
@@ -84,6 +85,11 @@ func (c *Client) Place(ctx context.Context, key, customer, token string, lines [
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Idempotency-Key", key)
+	// Pass the shopper's identity on, so the Order service applies the same
+	// ownership rules to a checkout as to any other order request.
+	if tok := identity.Token(ctx); tok != "" {
+		req.Header.Set(identity.Header, tok)
+	}
 	if id := reqid.From(ctx); id != "" {
 		req.Header.Set(reqid.Header, id)
 	}

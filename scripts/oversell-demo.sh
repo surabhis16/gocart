@@ -24,8 +24,12 @@ for url in "$PRODUCT" "$ORDER" "$PAYMENT"; do
   curl -fsS "$url/healthz" >/dev/null || { echo "$url is not healthy" >&2; exit 1; }
 done
 
+# The Order service answers a customer only with the gateway's signed identity.
+# Set IDENTITY_SECRET= (empty) when the services run without it.
+IDENTITY_SECRET="${IDENTITY_SECRET-dev-identity-secret-change-me-0123456789}"
+export IDENTITY_SECRET
 exec python3 - "$PRODUCT" "$ORDER" "$PAYMENT" "$ADMIN_KEY" "$BUYERS" "$STOCK" <<'PY'
-import json, sys, threading, time, urllib.request, urllib.error, uuid
+import base64, hashlib, hmac, json, os, sys, threading, time, urllib.request, urllib.error, uuid
 
 product, order, payment, admin_key, buyers, stock = sys.argv[1:4] + [sys.argv[4]] + [int(sys.argv[5]), int(sys.argv[6])]
 run = uuid.uuid4().hex[:8]  # makes idempotency keys unique per run
@@ -41,6 +45,16 @@ def call(method, url, body=None, headers=None):
         return e.code, json.loads(e.read() or b"null")
 
 admin = {"Authorization": "Bearer " + admin_key}
+
+def identity(cust):
+    """The signed header the gateway would add for this customer (see scripts/mint.py)."""
+    secret = os.environ.get("IDENTITY_SECRET", "")
+    if not secret:
+        return {}
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    body = "v1." + b64(json.dumps({"sub": cust, "exp": int(time.time()) + 300}, separators=(",", ":")).encode())
+    sig = b64(hmac.new(secret.encode(), body.encode(), hashlib.sha256).digest())
+    return {"X-Gocart-Identity": body + "." + sig}
 def say(msg): print("\n\033[1m%s\033[0m" % msg)
 
 say("Set lamp stock to %d" % stock)
@@ -56,7 +70,7 @@ def buy(i):
     barrier.wait()
     body = {"customer_id": "cust_%s_%d" % (run, i), "payment_token": "tok_visa",
             "items": [{"product_id": "prd_lamp", "quantity": 1}]}
-    code, resp = call("POST", order + "/orders", body, {"Idempotency-Key": "oversell-%s-%d" % (run, i)})
+    code, resp = call("POST", order + "/orders", body, {"Idempotency-Key": "oversell-%s-%d" % (run, i), **identity(body["customer_id"])})
     with lock:
         results.append((i, code, resp))
 

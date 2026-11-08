@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, request, requestRaw, toError } from "./client";
+import { ApiError, request, requestRaw } from "./client";
 import type { Cart, Charge, NewProduct, Order, OrderEvent, OrderStatus, Product, ServiceStatus } from "./types";
 import { interpretCheckout, interpretFailure, type CheckoutOutcome } from "../lib/checkout";
 import { isSettling } from "../lib/orderFlow";
@@ -30,7 +30,7 @@ export function useProducts() {
 // ---- cart ------------------------------------------------------------------
 
 export function useCart(customer: string) {
-  return useQuery({ queryKey: keys.cart(customer), queryFn: () => request<Cart>(`/carts/${enc(customer)}`) });
+  return useQuery({ queryKey: keys.cart(customer), queryFn: () => request<Cart>(`/carts/${enc(customer)}`), enabled: customer !== "" });
 }
 
 export function useSetItem(customer: string) {
@@ -106,10 +106,10 @@ export function useOrder(id: string) {
   });
 }
 
-function useOrderAction(action: "cancel" | "ship" | "deliver", admin: boolean) {
+function useOrderAction(action: "cancel" | "ship" | "deliver") {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => request<Order>(`/orders/${enc(id)}/${action}`, { method: "POST", admin }),
+    mutationFn: (id: string) => request<Order>(`/orders/${enc(id)}/${action}`, { method: "POST" }),
     onSuccess: (order) => {
       qc.setQueryData(keys.order(order.id), order);
       qc.invalidateQueries({ queryKey: ["orders"] });
@@ -119,9 +119,9 @@ function useOrderAction(action: "cancel" | "ship" | "deliver", admin: boolean) {
   });
 }
 
-export const useCancelOrder = () => useOrderAction("cancel", false);
-export const useShipOrder = () => useOrderAction("ship", true);
-export const useDeliverOrder = () => useOrderAction("deliver", true);
+export const useCancelOrder = () => useOrderAction("cancel");
+export const useShipOrder = () => useOrderAction("ship");
+export const useDeliverOrder = () => useOrderAction("deliver");
 
 // ---- admin -----------------------------------------------------------------
 
@@ -137,7 +137,7 @@ export function useAdminOrders(status: OrderStatus | "") {
 export function useOrderEvents(id: string) {
   return useQuery({
     queryKey: keys.events(id),
-    queryFn: async () => (await request<{ events: OrderEvent[] }>(`/orders/${enc(id)}/events`, { admin: true })).events,
+    queryFn: async () => (await request<{ events: OrderEvent[] }>(`/orders/${enc(id)}/events`)).events,
     refetchInterval: 3_000,
   });
 }
@@ -145,7 +145,7 @@ export function useOrderEvents(id: string) {
 export function useCharge(orderId: string) {
   return useQuery({
     queryKey: keys.charge(orderId),
-    queryFn: () => request<Charge>(`/charges/${enc(orderId)}`, { admin: true }),
+    queryFn: () => request<Charge>(`/charges/${enc(orderId)}`),
     retry: false, // an order that never reached payment has no charge: 404 is an answer
   });
 }
@@ -153,7 +153,7 @@ export function useCharge(orderId: string) {
 export function useCreateProduct() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (p: NewProduct) => request<Product>("/products", { method: "POST", body: p, admin: true }),
+    mutationFn: (p: NewProduct) => request<Product>("/products", { method: "POST", body: p }),
     onSuccess: () => qc.invalidateQueries({ queryKey: keys.products }),
   });
 }
@@ -162,7 +162,7 @@ export function useSetStock() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { id: string; stock: number }) =>
-      request<Product>(`/products/${enc(v.id)}/stock`, { method: "PUT", body: { stock: v.stock }, admin: true }),
+      request<Product>(`/products/${enc(v.id)}/stock`, { method: "PUT", body: { stock: v.stock } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: keys.products }),
   });
 }
@@ -173,20 +173,4 @@ export function useServiceStatus() {
     queryFn: async () => (await request<{ services: ServiceStatus[] }>("/status")).services,
     refetchInterval: 3_000,
   });
-}
-
-/**
- * Asks the Order service whether a key is accepted, without changing anything.
- * Reading the event log of an order that does not exist gives 404 to a valid
- * key and 401/403 to an invalid one, so the answer says exactly that.
- */
-export async function checkAdminKey(key: string): Promise<"valid" | "invalid" | "unreachable"> {
-  const res = await requestRaw("/orders/ord_key_check/events", {
-    headers: { Authorization: `Bearer ${key}` },
-  }).catch(() => null);
-  if (!res) return "unreachable";
-  if (res.status === 404) return "valid";
-  if (res.status === 401 || res.status === 403) return "invalid";
-  if (res.status >= 500) return "unreachable";
-  throw toError(res);
 }

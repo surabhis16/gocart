@@ -10,6 +10,19 @@
 //	CART_URL     base URL of the Cart service        (default http://localhost:8083)
 //	LOG_LEVEL    debug | info | warn | error         (default info)
 //
+// Sign-in (all required except the two marked optional):
+//
+//	PUBLIC_URL           where people reach this gateway, e.g. https://shop.example.com
+//	OIDC_ISSUER          the identity provider, as the browser reaches it
+//	OIDC_BACKCHANNEL_URL optional: where this server reaches it instead (same path, other host)
+//	OIDC_CLIENT_ID       this app's id at the provider      (default gocart-web)
+//	OIDC_CLIENT_SECRET   this app's secret at the provider
+//	SESSION_SECRET       signs the session cookie (32+ characters)
+//	IDENTITY_SECRET      signs what is sent to the services; they hold the same value (32+)
+//	ADMIN_KEY            the services' admin key; sent for administrators only
+//	ADMIN_EMAILS         optional: comma-separated emails that are administrators
+//	SIGNIN_HINT          optional: a line shown on the landing page, such as demo accounts
+//
 // Run with -healthcheck to probe a running instance and exit 0 or 1.
 package main
 
@@ -21,10 +34,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"gocart/web-service/internal/httpapi"
+	"gocart/web-service/internal/oidc"
 	"gocart/web-service/internal/ui"
 )
 
@@ -54,7 +69,11 @@ func run(log *slog.Logger, port string) error {
 		Payment: env("PAYMENT_URL", "http://localhost:8082"),
 		Cart:    env("CART_URL", "http://localhost:8083"),
 	}
-	api, err := httpapi.New(up, ui.Files(), log, httpapi.WithVersion(version))
+	auth, err := authFromEnv()
+	if err != nil {
+		return err
+	}
+	api, err := httpapi.New(up, ui.Files(), log, httpapi.WithVersion(version), httpapi.WithAuth(auth))
 	if err != nil {
 		return err
 	}
@@ -90,6 +109,40 @@ func run(log *slog.Logger, port string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// authFromEnv reads the sign-in settings. Missing ones are an error: a gateway
+// that quietly started without sign-in would be one that lets everyone in.
+func authFromEnv() (httpapi.Auth, error) {
+	public := strings.TrimRight(env("PUBLIC_URL", ""), "/")
+	if public == "" {
+		return httpapi.Auth{}, errors.New("PUBLIC_URL is required (for example http://localhost:3000)")
+	}
+	p, err := oidc.New(oidc.Config{
+		Issuer:         env("OIDC_ISSUER", ""),
+		BackchannelURL: env("OIDC_BACKCHANNEL_URL", ""),
+		ClientID:       env("OIDC_CLIENT_ID", "gocart-web"),
+		ClientSecret:   env("OIDC_CLIENT_SECRET", ""),
+		RedirectURL:    public + "/auth/callback",
+	}, nil)
+	if err != nil {
+		return httpapi.Auth{}, err
+	}
+	var admins []string
+	for _, e := range strings.Split(env("ADMIN_EMAILS", ""), ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			admins = append(admins, e)
+		}
+	}
+	return httpapi.Auth{
+		OIDC:           p,
+		SessionSecret:  []byte(env("SESSION_SECRET", "")),
+		IdentitySecret: []byte(env("IDENTITY_SECRET", "")),
+		AdminKey:       env("ADMIN_KEY", ""),
+		AdminEmails:    admins,
+		SignInHint:     env("SIGNIN_HINT", ""),
+		PublicURL:      public,
+	}, nil
 }
 
 func probe(port string) int {

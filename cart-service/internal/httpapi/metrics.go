@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,7 @@ type metrics struct {
 	requests map[reqKey]uint64
 	latency  map[string]*histogram // by route
 
+	authFailures atomic.Uint64
 }
 
 func newMetrics(service string) *metrics {
@@ -173,6 +175,9 @@ func (m *metrics) write(w io.Writer, gauges []Gauge) {
 	fmt.Fprintf(w, "# HELP gocart_uptime_seconds Seconds since the process started.\n# TYPE gocart_uptime_seconds gauge\n")
 	fmt.Fprintf(w, "gocart_uptime_seconds%s %.0f\n", labels(map[string]string{"service": m.service}), time.Since(m.start).Seconds())
 
+	fmt.Fprintf(w, "# HELP gocart_identity_failures_total Requests refused for a missing, expired or foreign identity.\n# TYPE gocart_identity_failures_total counter\n")
+	fmt.Fprintf(w, "gocart_identity_failures_total%s %d\n", labels(map[string]string{"service": m.service}), m.authFailures.Load())
+
 	fmt.Fprintf(w, "# HELP gocart_http_requests_total Requests handled, by route pattern and status.\n# TYPE gocart_http_requests_total counter\n")
 	for i, k := range reqs {
 		fmt.Fprintf(w, "gocart_http_requests_total%s %d\n",
@@ -214,6 +219,14 @@ func (m *metrics) write(w io.Writer, gauges []Gauge) {
 type Option func(*Server)
 
 // WithVersion labels gocart_build_info.
+// WithIdentity makes the server verify the gateway's signed identity assertion
+// with secret, so a customer can only reach their own cart. With require set, a
+// request that carries no assertion is refused; without it such requests are
+// treated as trusted local or service-to-service calls.
+func WithIdentity(secret []byte, require bool) Option {
+	return func(s *Server) { s.identitySecret, s.requireIdentity = secret, require }
+}
+
 func WithVersion(v string) Option { return func(s *Server) { s.metrics.version = v } }
 
 func (s *Server) serveMetrics(w http.ResponseWriter, _ *http.Request) {

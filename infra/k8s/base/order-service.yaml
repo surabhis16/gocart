@@ -44,7 +44,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: order-service
-          image: gocart/order-service:0.4.0
+          image: gocart/order-service:0.5.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -58,6 +58,8 @@ spec:
             - { name: PAYMENT_TTL, value: 15m }
             - { name: RECONCILE_INTERVAL, value: 5s }
             - { name: ADMIN_KEY, valueFrom: { secretKeyRef: { name: gocart-admin, key: admin-key } } }
+            - { name: IDENTITY_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: identity-secret } } }
+            - { name: REQUIRE_IDENTITY, value: "true" } # customer routes answer only to the gateway's signed identity
           # Readiness deliberately checks neither the Product nor the Payment
           # service: an order placed while one is down is still accepted (202)
           # and finished later, so being unable to reach them is not a reason

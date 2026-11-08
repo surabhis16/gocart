@@ -9,3 +9,25 @@ resources:
   - payment-service.yaml
   - cart-service.yaml
   - web-service.yaml
+  - dex.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  - name: dex-config
+    files:
+      - config.yaml=dex/config.yaml
+  - name: dex-theme
+    files:
+      - dex/theme/styles.css
+      - dex/theme/logo.png
+      - dex/theme/favicon.png
+      - dex/theme/bricolage-grotesque.woff2
+      - dex/theme/instrument-sans.woff2
+  # Where the shop lives, for the browser. Change these together with the issuer
+  # and the host in ../edge/edge.yaml. (Dex reads its issuer and redirect URI from these.)
+  - name: gocart-public
+    literals:
+      - public-url=https://gocart.localtest.me:8443
+      - oidc-issuer=https://gocart.localtest.me:8443/dex
+      - admin-emails= # who becomes an administrator, by verified email; an overlay or your own value fills this
+      - dex-demo-users=false # demo accounts only where an overlay says so
+      - signin-hint= # an overlay can add a line shown on the landing page

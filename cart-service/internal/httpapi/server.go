@@ -11,8 +11,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"gocart/cart-service/internal/cart"
+	"gocart/cart-service/internal/identity"
 	"gocart/cart-service/internal/orderclient"
 	"gocart/cart-service/internal/productclient"
 	"gocart/cart-service/internal/reqid"
@@ -43,6 +45,9 @@ type Server struct {
 	log     *slog.Logger
 	routes  []route
 	metrics *metrics
+
+	identitySecret  []byte
+	requireIdentity bool
 }
 
 // New builds a Server.
@@ -87,16 +92,55 @@ func (s *Server) Handler() http.Handler {
 	for _, rt := range s.routes {
 		mux.HandleFunc(rt.pattern, s.metrics.wrap(rt.pattern, rt.handler))
 	}
-	return requestID(accessLog(s.log, s.metrics.middleware(recoverer(s.log, mux))))
+	return requestID(accessLog(s.log, s.metrics.middleware(recoverer(s.log, s.identified(mux)))))
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// customer reads and validates the customer id in the path.
+// identified verifies the gateway's assertion when a request carries one. A bad
+// or expired assertion is a 401, never a quiet downgrade to "anonymous".
+func (s *Server) identified(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get(identity.Header)
+		if tok == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		claims, err := identity.Verify(s.identitySecret, tok, time.Now())
+		if len(s.identitySecret) == 0 || err != nil {
+			s.metrics.authFailures.Add(1)
+			writeProblem(w, r, Problem{
+				Type: "unauthenticated", Title: "Identity not accepted", Status: http.StatusUnauthorized,
+				Detail: "The identity assertion is missing, expired or not signed by the gateway. Sign in again.",
+			})
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(identity.With(r.Context(), claims, tok)))
+	})
+}
+
+// customer reads and validates the customer id in the path, and checks that
+// the caller may use that cart: a signed-in customer reaches only their own.
 func (s *Server) customer(w http.ResponseWriter, r *http.Request) (string, bool) {
 	id := r.PathValue("customer_id")
+	who, signedIn := identity.From(r.Context())
+	if !signedIn && s.requireIdentity {
+		s.metrics.authFailures.Add(1)
+		writeProblem(w, r, Problem{
+			Type: "unauthenticated", Title: "Sign in required", Status: http.StatusUnauthorized,
+			Detail: "This request carries no identity. A cart is only available to its owner.",
+		})
+		return "", false
+	}
+	if signedIn && who.Sub != id {
+		writeProblem(w, r, Problem{
+			Type: "forbidden", Title: "Not your cart", Status: http.StatusForbidden,
+			Detail: "You can only use your own cart.",
+		})
+		return "", false
+	}
 	if !cart.ValidCustomerID(id) {
 		writeProblem(w, r, Problem{
 			Type: "validation-failed", Title: "Validation failed", Status: http.StatusUnprocessableEntity,

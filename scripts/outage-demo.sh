@@ -38,13 +38,23 @@ wait_healthy() {
   for _ in $(seq 1 60); do curl -fsS "$1/healthz" >/dev/null 2>&1 && return 0; sleep 1; done
   echo "$1 did not become healthy" >&2; return 1
 }
+# The Order service answers a customer only with the gateway's signed identity.
+# Set IDENTITY_SECRET= (empty) when the services run without it.
+IDENTITY_SECRET="${IDENTITY_SECRET-dev-identity-secret-change-me-0123456789}"
+asdemo() { # curl args... : as customer cust_demo
+  if [ -n "$IDENTITY_SECRET" ]; then
+    curl -H "X-Gocart-Identity: $("$(dirname "$0")/mint.py" identity "$IDENTITY_SECRET" cust_demo)" "$@"
+  else
+    curl "$@"
+  fi
+}
 stock() { curl -fsS "$PRODUCT/products/$1" | field "d['stock']"; }
 
 # order_during_outage KEY PRODUCT_ID -> places an order, expects 202, sets $id
 order_during_outage() {
   local key=$1 prd=$2
   local code
-  code=$(curl -sS -o "$BODY" -w '%{http_code}' -X POST "$ORDER/orders" \
+  code=$(asdemo -sS -o "$BODY" -w '%{http_code}' -X POST "$ORDER/orders" \
     -H 'Content-Type: application/json' -H "Idempotency-Key: $key" \
     -d "{\"customer_id\":\"cust_demo\",\"payment_token\":\"tok_visa\",\"items\":[{\"product_id\":\"$prd\",\"quantity\":3}]}")
   id=$(field "d['id']" <"$BODY")
@@ -56,7 +66,7 @@ order_during_outage() {
 wait_for_confirmed() {
   local status=placed i
   for i in $(seq 1 "$SETTLE_SECONDS"); do
-    status=$(curl -fsS "$ORDER/orders/$id" | field "d['status']")
+    status=$(asdemo -fsS "$ORDER/orders/$id" | field "d['status']")
     case "$status" in placed|awaiting_payment) sleep 1 ;; *) break ;; esac
   done
   echo "   status after ${i}s: $status"
@@ -94,7 +104,7 @@ echo "   Notebook stock: $before -> $after (expected $((before - 3)))"
 [ "$after" -eq $((before - 3)) ] || { echo "stock is wrong" >&2; exit 1; }
 
 say "4. Retrying the original request is safe"
-code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$ORDER/orders" \
+code=$(asdemo -sS -o /dev/null -w '%{http_code}' -X POST "$ORDER/orders" \
   -H 'Content-Type: application/json' -H "Idempotency-Key: outage-product-$RUN" \
   -d '{"customer_id":"cust_demo","payment_token":"tok_visa","items":[{"product_id":"prd_notebook","quantity":3}]}')
 after2=$(stock prd_notebook)

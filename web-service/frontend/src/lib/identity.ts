@@ -1,63 +1,53 @@
-// There are no logins yet. A visitor is whoever they say they are: a customer
-// id is picked on the first visit and kept in this browser. The header says so.
-// (The services behave the same way: anyone who knows an id can read its cart.)
-import { useSyncExternalStore } from "react";
+// Who is signed in. The gateway owns this: the browser holds a signed cookie it
+// cannot read, and asks GET /api/me who it belongs to. Nothing about identity is
+// kept in localStorage, and the page never sees a token.
+import { createContext, useContext } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { request } from "../api/client";
 
-const STORAGE_KEY = "gocart.customer";
-export const CUSTOMER_ID = /^[A-Za-z0-9._-]{1,64}$/;
-
-const listeners = new Set<() => void>();
-
-function read(): string {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved && CUSTOMER_ID.test(saved)) return saved;
-  } catch {
-    /* private mode or blocked storage: fall through to a session-only id */
-  }
-  return "";
+export interface SignedOut {
+  signed_in: false;
+  /** A line from the deployment, such as demo accounts. Shown on the landing page only. */
+  hint?: string;
 }
 
-let current = read() || remember(newId());
-
-/** Keeps a freshly made id, so a reload is the same shopper and not a new one. */
-function remember(id: string): string {
-  try {
-    localStorage.setItem(STORAGE_KEY, id);
-  } catch {
-    /* session-only id */
-  }
-  return id;
+export interface SignedIn {
+  signed_in: true;
+  customer_id: string;
+  name: string;
+  email: string;
+  role: "customer" | "admin";
 }
 
-function newId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(4));
-  return "cust_" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+export type Me = SignedOut | SignedIn;
+
+export const meKey = ["me"] as const;
+
+export function useMe() {
+  return useQuery({
+    queryKey: meKey,
+    queryFn: () => request<Me>("/me"),
+    staleTime: 60_000,
+    retry: false,
+  });
 }
 
-export function getCustomerId(): string {
-  return current;
+/** Where /auth/login sends people after they sign in. Only a path on this site is honoured. */
+export function signInUrl(next: string): string {
+  return `/auth/login?next=${encodeURIComponent(next)}`;
 }
 
-/** Returns false, and changes nothing, if the id is not acceptable. */
-export function setCustomerId(id: string): boolean {
-  if (!CUSTOMER_ID.test(id)) return false;
-  current = id;
-  try {
-    localStorage.setItem(STORAGE_KEY, id);
-  } catch {
-    /* keep it for this session only */
-  }
-  listeners.forEach((l) => l());
-  return true;
+const SignedInContext = createContext<SignedIn | null>(null);
+export const SignedInProvider = SignedInContext.Provider;
+
+/** The signed-in person. Only valid below RequireSignIn, which is the only thing that provides it. */
+export function useSignedIn(): SignedIn {
+  const me = useContext(SignedInContext);
+  if (!me) throw new Error("useSignedIn used outside RequireSignIn");
+  return me;
 }
 
+/** The customer id the services know this person by. */
 export function useCustomerId(): string {
-  return useSyncExternalStore(
-    (l) => {
-      listeners.add(l);
-      return () => listeners.delete(l);
-    },
-    () => current,
-  );
+  return useSignedIn().customer_id;
 }

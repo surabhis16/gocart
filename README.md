@@ -15,9 +15,9 @@ The parts worth seeing:
 - 20 customers each double-click "buy" at the same instant for 3 lamps: exactly 3 are sold, 3 are charged, nobody is charged twice.
 
 ```
-docker compose up --build        # open http://localhost:3000 (admin key: dev-admin-key)
+docker compose up --build        # open http://localhost:3000, press Sign in (demo accounts: see docs/operations.md; Google and GitHub sign-in via .env)
                                  # Product :8080, Order :8081, Payment :8082, Cart :8083
-./scripts/smoke.sh               # 82 checks across all five services
+./scripts/smoke.sh               # 99 checks across all five services
 ./scripts/oversell-demo.sh       # many buyers, little stock
 ./scripts/outage-demo.sh         # Product down, then Payment down
 ```
@@ -52,23 +52,20 @@ gocart-umbrella/
 
 | Part | Status |
 |---|---|
-| Go: 227 tests (276 with subtests) across five modules, `-race`, `gofmt`, `go vet` | **Passing**, in the sandbox and in CI. |
-| Front end: 20 tests, type-check, lint, production build, generated API types up to date | **Passing**, in the sandbox and in the CI `frontend` job. |
-| The five services running together, driven by `smoke.sh` | **82 of 82 checks pass**, in the sandbox on real processes and on the author's Docker Compose stack. |
-| The storefront in a real browser (browse, cart, pay, receipt, admin, system page, phone width) | **Driven with Playwright** in the sandbox against the real services. Not covered by automated browser tests. |
+| Go: 279 tests (331 with subtests) across five modules, `-race`, `gofmt`, `go vet` | **Passing**, in the sandbox and in CI. |
+| Front end: 25 tests, type-check, lint, production build, generated API types up to date | **Passing**|
+| The five services running together, driven by `smoke.sh` | **99 of 99 checks pass** on real processes |
+| The storefront in a real browser (browse, cart, pay, receipt, admin, system page, phone width) | **Working** |
+| Sign-in and ownership in a real browser | **Working**: landing page, sign-in, two customers unable to see each other's cart or orders, the admin gate, sign-out, phone width. |
+| Dex, Traefik, cert-manager, NetworkPolicies, Google and GitHub sign-in | **Working*". The manifests are schema-valid and cross-checked by `check-k8s.py` (including that every caller is admitted by a policy and the public address agrees everywhere), but need a real cluster. See [operations.md](docs/operations.md#sign-in-secrets-and-the-edge). |
 | Checkout while the Order service is down, then recovered | **Checked on real processes**: `503`, cart unchanged; after restart one order, and a repeat returns it again. |
 | Oversell demo and outage-and-recovery demo | **Pass** against the real processes, and in the CI `end-to-end` job. |
 | Restart rebuilds the read model; clean SIGTERM shutdown; `-healthcheck` | **Checked** on the real binaries. |
 | Tests that can fail | The OpenAPI drift check and key service behaviours were **mutation-tested**: broken on purpose, tests went red. |
 | Dockerfiles and Compose | **Built and started** by the author (`docker compose up --build`, five images). |
-| **Cassandra event store**, including two Order replicas on the change feed | **Passes** its tests on a live Cassandra in CI, and runs on Kubernetes (`staging-cassandra`), checked by the author. |
+| **Cassandra event store**, including two Order replicas on the change feed | **Passes** its tests on a live Cassandra in CI, and runs on Kubernetes (`staging-cassandra`). |
 | Kubernetes manifests | **Schema-valid** against Kubernetes 1.31 (strict) with cross-reference checks, and **applied** by the author in the Cassandra staging overlay. The other overlays and the web gateway's two-replica rollout were not separately exercised. |
 | Terraform | **`validate` passes; `plan` shows 16 to add** (5 repositories, 5 lifecycle policies, 5 log groups, 1 IAM policy). Never applied to a real AWS account. |
-| Scripts | `shellcheck` clean. `bump-version.sh` round-trip tested. `ship.sh` run by the author for the Cassandra staging flow; `cleanup.sh` not separately confirmed. |
+| Scripts | `shellcheck` clean. `bump-version.sh` round-trip tested. `ship.sh` run for the Cassandra staging flow; `cleanup.sh` not separately confirmed. |
 | GitHub Actions workflows | **A full run is green**, including the Cassandra job. |
 
-## Limits, and upgrading
-
-The known limits are in a table in [architecture.md](docs/architecture.md#known-limits): one replica each (Order can run two on Cassandra), only a shared admin key for access control, a mock payment provider, and a polling reconciler. They are written down so they are choices you can defend, and the table is also the answer to "what would you change for production?".
-
-Version 0.2 made `payment_token` **required** on `POST /orders`, a deliberate breaking change explained in [operations.md](docs/operations.md#a-real-breaking-change-and-how-it-was-handled). Anything written against 0.1 (a Postman collection, say) needs that one field added. Order logs written by 0.1 still replay.

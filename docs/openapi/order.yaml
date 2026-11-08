@@ -33,6 +33,14 @@ info:
     the same key with the same request returns the same order (`200`) instead
     of creating a second one. Reusing a key with a different request is a `422`.
 
+    **Who is asking.** Customer routes (`POST /orders`, `GET /orders`,
+    `GET /orders/{id}`, cancel) check the gateway's signed identity
+    (`X-Gocart-Identity`, see `identity` under security schemes). A customer can
+    place orders only in their own name (`403` otherwise), list only their own,
+    and sees someone else's order as `404`, so ids cannot be probed. An
+    administrator can see all. Shipping, delivering and the event log are the
+    shop's own tooling and need the admin key, not a customer identity.
+
     **Money** is an integer in the smallest currency unit (paise), never a float.
 
     **Errors** are RFC 9457 problem documents (`application/problem+json`) whose
@@ -100,6 +108,10 @@ paths:
             schema:
               $ref: "#/components/schemas/PlaceOrderRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "201":
           description: Confirmed. Stock is reserved and the order is priced.
           headers:
@@ -190,6 +202,10 @@ paths:
             maximum: 200
             default: 50
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Matching orders.
           content:
@@ -212,6 +228,10 @@ paths:
       parameters:
         - $ref: "#/components/parameters/OrderId"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: The order.
           content:
@@ -279,6 +299,10 @@ paths:
                   type: string
                   maxLength: 200
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: The cancelled order.
           content:
@@ -365,6 +389,22 @@ components:
         pattern: "^[A-Za-z0-9._:-]{1,128}$"
         example: checkout-7c1e2f
   responses:
+    Unauthenticated:
+      description: |
+        `unauthenticated` (401): the service requires the gateway's signed identity
+        and the request has none, or the one it has is invalid or expired.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: |
+        `forbidden` (403): the signed-in customer is not the customer this request
+        is about.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
     MalformedBody:
       description: The body is not valid JSON, has unknown fields, or has trailing data.
       content:
@@ -399,13 +439,24 @@ components:
           schema:
             $ref: "#/components/schemas/Problem"
   securitySchemes:
+    identity:
+      type: apiKey
+      in: header
+      name: X-Gocart-Identity
+      description: |
+        A short-lived signed assertion of who is asking, made by the web gateway
+        after a customer signs in (`v1.<payload>.<HMAC-SHA256 signature>`). Services
+        verify it with the shared `IDENTITY_SECRET`. With `REQUIRE_IDENTITY=true`
+        (compose and Kubernetes) customer routes refuse requests without it;
+        without that flag a request with no assertion is treated as trusted local
+        use, but a *bad* assertion is still refused.
     adminKey:
       type: http
       scheme: bearer
       description: |
         The shop's own shared secret (`ADMIN_KEY`), sent as
         `Authorization: Bearer <key>`. It says "this is the shop's tooling", not
-        "this is customer X"; there are no customer logins yet.
+        "this is customer X"; customers are told apart by the signed identity.
   schemas:
     Status:
       type: string

@@ -32,7 +32,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: web-service
-          image: gocart/web-service:0.4.0
+          image: gocart/web-service:0.5.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -44,6 +44,15 @@ spec:
             - { name: ORDER_URL, value: "http://order-service:8081" }
             - { name: PAYMENT_URL, value: "http://payment-service:8082" }
             - { name: CART_URL, value: "http://cart-service:8083" }
+            - { name: ADMIN_KEY, valueFrom: { secretKeyRef: { name: gocart-admin, key: admin-key } } }
+            - { name: IDENTITY_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: identity-secret } } }
+            - { name: SESSION_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: session-secret } } }
+            - { name: OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: gocart-auth, key: oidc-client-secret } } }
+            - { name: PUBLIC_URL, valueFrom: { configMapKeyRef: { name: gocart-public, key: public-url } } }
+            - { name: OIDC_ISSUER, valueFrom: { configMapKeyRef: { name: gocart-public, key: oidc-issuer } } }
+            - { name: ADMIN_EMAILS, valueFrom: { configMapKeyRef: { name: gocart-public, key: admin-emails } } }
+            - { name: SIGNIN_HINT, valueFrom: { configMapKeyRef: { name: gocart-public, key: signin-hint } } }
+            - { name: OIDC_BACKCHANNEL_URL, value: "http://dex:5556/dex" } # in-cluster route to Dex; the browser uses the public issuer
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 5

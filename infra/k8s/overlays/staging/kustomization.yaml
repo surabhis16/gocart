@@ -4,10 +4,27 @@ namespace: gocart-staging
 resources:
   - namespace.yaml
   - ../../base
+configMapGenerator:
+  # This overlay is a demo: it turns on Dex's throwaway accounts and says so on the landing page.
+  - name: gocart-public
+    behavior: merge
+    literals:
+      - dex-demo-users=true
+      - admin-emails=admin@gocart.test
+      - 'signin-hint=Demo accounts: user1@gocart.test, user2@gocart.test, admin@gocart.test. Password: gocart-demo'
 secretGenerator:
   - name: gocart-admin
     literals:
       - admin-key=dev-admin-key # DEMO VALUE. See docs/operations.md before using this anywhere real.
+    options:
+      disableNameSuffixHash: true
+  - name: gocart-auth
+    literals: # DEMO VALUES, like the admin key. Real ones: docs/operations.md.
+      - identity-secret=dev-identity-secret-change-me-0123456789
+      - session-secret=dev-session-secret-change-me-0123456789
+      - oidc-client-secret=dev-oidc-client-secret
+      # To add "Log in with Google" or GitHub, add the keys google-client-id, google-client-secret,
+      # github-client-id, github-client-secret (see docs/operations.md; keep real values out of git).
     options:
       disableNameSuffixHash: true
 # The tags below are bumped together with the VERSION file by
@@ -15,16 +32,16 @@ secretGenerator:
 images:
   - name: gocart/product-service
     newName: localhost:5000/gocart/product-service
-    newTag: 0.4.0
+    newTag: 0.5.0
   - name: gocart/order-service
     newName: localhost:5000/gocart/order-service
-    newTag: 0.4.0
+    newTag: 0.5.0
   - name: gocart/payment-service
     newName: localhost:5000/gocart/payment-service
-    newTag: 0.4.0
+    newTag: 0.5.0
   - name: gocart/cart-service
     newName: localhost:5000/gocart/cart-service
-    newTag: 0.4.0
+    newTag: 0.5.0
   - name: gocart/web-service
     newName: localhost:5000/gocart/web-service
-    newTag: 0.4.0
+    newTag: 0.5.0

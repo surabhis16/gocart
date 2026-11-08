@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gocart/order-service/internal/domain"
+	"gocart/order-service/internal/identity"
 	"gocart/order-service/internal/projection"
 	"gocart/order-service/internal/reqid"
 	"gocart/order-service/internal/service"
@@ -44,6 +45,9 @@ type Server struct {
 	routes   []route
 	metrics  *metrics
 	adminKey string
+
+	identitySecret  []byte // verifies the gateway's assertion; empty: assertions are refused
+	requireIdentity bool   // customer routes answer 401 to a caller that is not signed in
 }
 
 // New builds a Server.
@@ -101,7 +105,57 @@ func (s *Server) Handler() http.Handler {
 	for _, rt := range s.routes {
 		mux.HandleFunc(rt.pattern, s.metrics.wrap(rt.pattern, rt.handler))
 	}
-	return requestID(accessLog(s.log, s.metrics.middleware(recoverer(s.log, mux))))
+	return requestID(accessLog(s.log, s.metrics.middleware(recoverer(s.log, s.identified(mux)))))
+}
+
+// identified verifies the gateway's assertion when a request carries one and
+// makes the caller available to the handlers. A bad or expired assertion is a
+// 401 and never a quiet downgrade to "anonymous".
+func (s *Server) identified(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get(identity.Header)
+		if tok == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		claims, err := identity.Verify(s.identitySecret, tok, time.Now())
+		if len(s.identitySecret) == 0 || err != nil {
+			s.metrics.authFailures.Add(1)
+			writeProblem(w, r, Problem{
+				Type: "unauthenticated", Title: "Identity not accepted", Status: http.StatusUnauthorized,
+				Detail: "The identity assertion is missing, expired or not signed by the gateway. Sign in again.",
+			})
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(identity.With(r.Context(), claims, tok)))
+	})
+}
+
+// caller says who is asking. signedIn is false for a service-to-service or
+// local call that carries no assertion; with requireIdentity set that is
+// refused here, and ok is false because the 401 has been written.
+func (s *Server) caller(w http.ResponseWriter, r *http.Request) (c identity.Claims, signedIn, ok bool) {
+	if c, signedIn = identity.From(r.Context()); signedIn {
+		return c, true, true
+	}
+	if s.requireIdentity {
+		s.metrics.authFailures.Add(1)
+		writeProblem(w, r, Problem{
+			Type: "unauthenticated", Title: "Sign in required", Status: http.StatusUnauthorized,
+			Detail: "This request carries no identity. Orders are only available to the customer who placed them.",
+		})
+		return c, false, false
+	}
+	return c, false, true
+}
+
+// owns: a signed-in customer sees their own orders, an administrator sees all.
+func owns(c identity.Claims, signedIn bool, customerID string) bool {
+	return !signedIn || c.Admin() || c.Sub == customerID
+}
+
+func forbidden(w http.ResponseWriter, r *http.Request, detail string) {
+	writeProblem(w, r, Problem{Type: "forbidden", Title: "Not your order", Status: http.StatusForbidden, Detail: detail})
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -114,7 +168,15 @@ func (s *Server) placeOrder(w http.ResponseWriter, r *http.Request) {
 		Items        []domain.Item `json:"items"`
 		PaymentToken string        `json:"payment_token"`
 	}
+	who, signedIn, ok := s.caller(w, r)
+	if !ok {
+		return
+	}
 	if !decode(w, r, &in, false) {
+		return
+	}
+	if signedIn && who.Sub != in.CustomerID {
+		forbidden(w, r, "An order can only be placed for the customer who is signed in.")
 		return
 	}
 	key := r.Header.Get(idempotencyHdr)
@@ -171,6 +233,10 @@ func (s *Server) placeOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
+	who, signedIn, ok := s.caller(w, r)
+	if !ok {
+		return
+	}
 	// Served from the read model; if it has never heard of the id, the service
 	// checks the store, since another replica may have created the order a
 	// moment ago.
@@ -179,12 +245,28 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if !owns(who, signedIn, v.CustomerID) {
+		// Someone else's order is indistinguishable from one that does not exist.
+		s.fail(w, r, service.ErrNotFound)
+		return
+	}
 	writeJSON(w, http.StatusOK, v)
 }
 
 func (s *Server) listOrders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	who, signedIn, ok := s.caller(w, r)
+	if !ok {
+		return
+	}
 	f := projection.Filter{CustomerID: q.Get("customer_id")}
+	if signedIn && !who.Admin() {
+		if f.CustomerID != "" && f.CustomerID != who.Sub {
+			forbidden(w, r, "You can only list your own orders.")
+			return
+		}
+		f.CustomerID = who.Sub
+	}
 	if st := q.Get("status"); st != "" {
 		valid := false
 		names := make([]string, len(domain.AllStatuses))
@@ -238,8 +320,18 @@ func (s *Server) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Reason string `json:"reason"`
 	}
+	who, signedIn, ok := s.caller(w, r)
+	if !ok {
+		return
+	}
 	if !decode(w, r, &in, true) {
 		return
+	}
+	if signedIn && !who.Admin() {
+		if cur, err := s.svc.Order(r.PathValue("id")); err == nil && !owns(who, signedIn, cur.CustomerID) {
+			s.fail(w, r, service.ErrNotFound)
+			return
+		}
 	}
 	v, err := s.svc.Cancel(r.Context(), r.PathValue("id"), in.Reason)
 	if err != nil {

@@ -198,6 +198,30 @@ export interface components {
         };
     };
     responses: {
+        /**
+         * @description `unauthenticated` (401): the service requires the gateway's signed identity
+         *     and the request has none, or the one it has is invalid or expired.
+         */
+        Unauthenticated: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
+        /**
+         * @description `forbidden` (403): the signed-in customer is not the customer this request
+         *     is about.
+         */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description The body is not valid JSON, has unknown fields, or has trailing data. */
         MalformedBody: {
             headers: {
@@ -298,6 +322,8 @@ export interface operations {
                     "application/json": components["schemas"]["Cart"];
                 };
             };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
             422: components["responses"]["ValidationFailed"];
         };
     };
@@ -319,6 +345,8 @@ export interface operations {
                 };
                 content?: never;
             };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
             422: components["responses"]["ValidationFailed"];
         };
     };
@@ -348,6 +376,8 @@ export interface operations {
                 };
             };
             400: components["responses"]["MalformedBody"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
             413: components["responses"]["TooLarge"];
             /**
              * @description `validation-failed` (quantity out of range, more than 50 products)
@@ -394,6 +424,8 @@ export interface operations {
                     "application/json": components["schemas"]["Cart"];
                 };
             };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
             422: components["responses"]["ValidationFailed"];
         };
     };
@@ -443,6 +475,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["MalformedBody"];
+            401: components["responses"]["Unauthenticated"];
             /**
              * @description `payment-declined`, from the Order service. Definite. The cart is
              *     kept, so the customer can try another card.
@@ -455,6 +488,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            403: components["responses"]["Forbidden"];
             /**
              * @description `cart-empty`, or `order-rejected` from the Order service (for
              *     example, not enough stock). The cart is kept.

@@ -1,53 +1,55 @@
-import { useState, type FormEvent } from "react";
-import { Link, NavLink, Outlet } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { signOut as endSession } from "../api/client";
 import { useCart } from "../api/hooks";
 import { itemCount } from "../lib/cart";
-import { setCustomerId, useCustomerId } from "../lib/identity";
+import { meKey, signInUrl, useMe, type SignedIn } from "../lib/identity";
 import { Icon } from "./ui";
 
 const link = ({ isActive }: { isActive: boolean }) =>
   `border-b-2 px-1 py-1 text-sm font-semibold transition ${isActive ? "border-brand text-ink" : "border-transparent text-muted hover:text-ink"}`;
 
-function Identity() {
-  const customer = useCustomerId();
-  const [error, setError] = useState("");
-
-  function submit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const next = String(new FormData(e.currentTarget).get("id") ?? "").trim();
-    if (!setCustomerId(next)) {
-      setError("Use 1–64 letters, digits, dots, dashes or underscores.");
-      return;
-    }
-    setError("");
-    (e.currentTarget.closest("details") as HTMLDetailsElement | null)?.removeAttribute("open");
-  }
-
+function Account({ me }: { me: SignedIn }) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const signOut = useMutation({
+    mutationFn: endSession,
+    onSettled: () => {
+      qc.clear();
+      qc.setQueryData(meKey, { signed_in: false });
+      navigate("/");
+    },
+  });
   return (
     <details className="relative">
-      <summary className="cursor-pointer list-none rounded-md border border-ink/30 px-2.5 py-1 font-mono text-xs text-muted hover:border-ink hover:text-ink">
-        {customer}
+      <summary className="cursor-pointer list-none rounded-md border border-ink/30 px-2.5 py-1 text-sm font-semibold hover:border-ink">
+        {me.name.split(" ")[0]}
       </summary>
-      <form onSubmit={submit} className="panel absolute right-0 z-10 mt-2 w-72 p-4">
-        <label htmlFor="customer-id" className="text-sm font-medium">
-          Shopping as
-        </label>
-        <p className="mb-2 mt-0.5 text-xs text-muted">
-          There are no accounts in this demo. Your cart and orders belong to this id, kept in this browser. Use another
-          id to be another shopper.
+      <div className="panel absolute right-0 z-10 mt-2 w-72 p-4">
+        <p className="font-semibold">{me.name}</p>
+        <p className="text-sm text-muted">{me.email}</p>
+        <p className="mt-2 text-xs text-muted">
+          Customer id <span className="font-mono text-ink">{me.customer_id}</span>
+          {me.role === "admin" && " · administrator"}
         </p>
-        <input id="customer-id" name="id" defaultValue={customer} key={customer} className="input font-mono" autoComplete="off" />
-        {error && <p className="mt-1 text-xs text-bad">{error}</p>}
-        <button className="mt-3 rounded-md bg-brand px-3 py-1.5 text-sm font-semibold text-brand-ink">Switch</button>
-      </form>
+        <button
+          className="mt-3 rounded-md border border-ink/30 px-3 py-1.5 text-sm font-semibold hover:border-ink"
+          onClick={() => signOut.mutate()}
+          disabled={signOut.isPending}
+        >
+          Sign out
+        </button>
+      </div>
     </details>
   );
 }
 
 export function Layout() {
-  const customer = useCustomerId();
-  const cart = useCart(customer);
-  const count = itemCount(cart.data);
+  const me = useMe();
+  const person = me.data?.signed_in ? me.data : null;
+  const cart = useCart(person?.customer_id ?? "");
+  const count = person ? itemCount(cart.data) : 0;
+  const here = useLocation();
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -77,14 +79,27 @@ export function Layout() {
             </NavLink>
           </nav>
           <div className="ml-auto flex items-center gap-2">
-            <Identity />
-            <NavLink to="/admin" className={link}>
-              <span className="flex items-center gap-1.5">
-                <Icon name="shield" className="h-4 w-4" />
-                <span className="hidden sm:inline">Admin</span>
-                <span className="sr-only sm:hidden">Admin</span>
-              </span>
-            </NavLink>
+            {person?.role === "admin" && (
+              <NavLink to="/admin" className={link}>
+                <span className="flex items-center gap-1.5">
+                  <Icon name="shield" className="h-4 w-4" />
+                  <span className="hidden sm:inline">Admin</span>
+                  <span className="sr-only sm:hidden">Admin</span>
+                </span>
+              </NavLink>
+            )}
+            {person ? (
+              <Account me={person} />
+            ) : (
+              me.isSuccess && (
+                <a
+                  href={signInUrl(here.pathname === "/" ? "/shop" : here.pathname + here.search)}
+                  className="rounded-md bg-brand px-3 py-1.5 text-sm font-semibold text-brand-ink hover:opacity-90"
+                >
+                  Sign in
+                </a>
+              )
+            )}
           </div>
         </div>
       </header>

@@ -22,7 +22,7 @@ def docs(path):
 # 1. Every plain manifest validates against the real Kubernetes schemas.
 manifests = [ROOT/"base/product-service.yaml", ROOT/"base/order-service.yaml",
              ROOT/"base/payment-service.yaml", ROOT/"base/cart-service.yaml", ROOT/"base/web-service.yaml",
-             ROOT/"cassandra/cassandra.yaml", ROOT/"overlays/local/namespace.yaml",
+             ROOT/"base/dex.yaml", ROOT/"base/networkpolicy.yaml",              ROOT/"cassandra/cassandra.yaml", ROOT/"overlays/local/namespace.yaml",
              ROOT/"overlays/staging/namespace.yaml"]
 n = 0
 for m in manifests:
@@ -120,7 +120,7 @@ for (kd, _), d in by_kind.items():
         for c in d["spec"]["template"]["spec"]["containers"]:
             for e in c.get("env", []):
                 ref = e.get("valueFrom", {}).get("secretKeyRef")
-                if ref:
+                if ref and not ref.get("optional"):
                     needed.add((ref["name"], ref["key"]))
 for ov in ("overlays/local", "overlays/staging"):
     gen = {}
@@ -131,12 +131,159 @@ for ov in ("overlays/local", "overlays/staging"):
         if (name, key) not in gen:
             problems.append(f"{ov} does not generate secret {name}/{key}, which a Deployment reads")
 
+# Every ConfigMap key a workload reads must come from a generator in the base.
+base_k = yaml.safe_load((ROOT/"base/kustomization.yaml").read_text())
+cm_keys = {}
+for g in base_k.get("configMapGenerator", []):
+    cm_keys[g["name"]] = {l.split("=", 1)[0] for l in g.get("literals", [])} | {f.split("=", 1)[0] for f in g.get("files", [])}
+    for f in g.get("files", []):
+        if not (ROOT/"base"/f.split("=", 1)[-1]).exists():
+            problems.append(f"base: configMapGenerator {g['name']} reads {f}, which does not exist")
+for (kd, nm), d in by_kind.items():
+    if kd == "Deployment":
+        pod = d["spec"]["template"]["spec"]
+        for c in pod["containers"]:
+            for e in c.get("env", []):
+                ref = e.get("valueFrom", {}).get("configMapKeyRef")
+                if ref and ref["key"] not in cm_keys.get(ref["name"], ()):
+                    problems.append(f"{nm}: reads ConfigMap {ref['name']}/{ref['key']}, which the base does not generate")
+        for v in pod.get("volumes", []):
+            cm = v.get("configMap", {}).get("name")
+            if cm and cm not in cm_keys:
+                problems.append(f"{nm}: mounts ConfigMap {cm!r}, which the base does not generate")
+
+# Network policies: every service a workload calls must admit that workload, and
+# nothing that no one calls may be open to it. (default-deny means a missing
+# allow is an outage that only shows up in a real cluster.)
+allowed = {}   # target app name -> set of caller app names
+for (kd, nm), d in by_kind.items():
+    if kd != "NetworkPolicy" or nm in ("default-deny-ingress", "allow-ingress-controller"):
+        continue
+    target = d["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/name"]
+    for rule in d["spec"]["ingress"]:
+        for f in rule["from"]:
+            allowed.setdefault(target, set()).add(f["podSelector"]["matchLabels"]["app.kubernetes.io/name"])
+if ("NetworkPolicy", "default-deny-ingress") not in by_kind:
+    problems.append("no default-deny NetworkPolicy: the allow rules would restrict nothing")
+calls = {}
+for (kd, nm), d in by_kind.items():
+    if kd != "Deployment":
+        continue
+    me = d["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/name"]
+    for c in d["spec"]["template"]["spec"]["containers"]:
+        for e in c.get("env", []):
+            v = e.get("value", "")
+            if e["name"].endswith("_URL") and v.startswith("http://"):
+                host = v[len("http://"):].split(":")[0]
+                calls.setdefault(host, set()).add(me)
+for target, callers in calls.items():
+    if allowed.get(target, set()) != callers:
+        problems.append(f"NetworkPolicy for {target} admits {sorted(allowed.get(target, []))}, but {sorted(callers)} call it")
+ctl = by_kind.get(("NetworkPolicy", "allow-ingress-controller"))
+if ctl:
+    admitted = set(ctl["spec"]["podSelector"]["matchExpressions"][0]["values"])
+    if admitted != {"web-service", "dex"}:
+        problems.append(f"the ingress controller may reach {sorted(admitted)}; it should reach exactly web-service and dex")
+    ns = ctl["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+    if ns != "traefik":
+        problems.append(f"the policy admits the ingress controller from namespace {ns!r}, but docs/operations.md installs Traefik into 'traefik'")
+
+# The public address must read the same everywhere it appears, or sign-in breaks
+# with an error that does not say why.
+pub = {l.split("=", 1)[0]: l.split("=", 1)[1] for g in base_k["configMapGenerator"] if g["name"] == "gocart-public" for l in g["literals"]}
+# Dex is configured by environment variables read by a template (dex/config.yaml),
+# the same template compose uses. Every variable the template reads must be given
+# by the Deployment (and by compose), and the address must be built from the
+# shared public values so it cannot disagree with the gateway's.
+import re
+tpl = (ROOT/"base/dex/config.yaml").read_text()
+wanted = set(re.findall(r'getenv "([A-Z0-9_]+)"', tpl))
+dex_pod = by_kind[("Deployment", "dex")]["spec"]["template"]["spec"]
+dex_env = {e["name"]: e for e in dex_pod["containers"][0]["env"]}
+for name in sorted(wanted - set(dex_env)):
+    problems.append(f"dex/config.yaml reads {name}, which the Dex Deployment does not set")
+if "theme: gocart" not in tpl:
+    problems.append("dex/config.yaml does not select the gocart theme")
+def cmref(e):
+    r = e.get("valueFrom", {}).get("configMapKeyRef")
+    return (r["name"], r["key"]) if r else None
+if cmref(dex_env.get("DEX_ISSUER", {})) != ("gocart-public", "oidc-issuer"):
+    problems.append("Dex's issuer is not taken from gocart-public/oidc-issuer, so it could differ from the gateway's")
+if cmref(dex_env.get("PUBLIC_URL", {})) != ("gocart-public", "public-url") or dex_env.get("GOCART_REDIRECT_URI", {}).get("value") != "$(PUBLIC_URL)/auth/callback":
+    problems.append("Dex's redirect URI is not built from gocart-public/public-url + /auth/callback")
+if not pub["oidc-issuer"].startswith(pub["public-url"] + "/"):
+    problems.append(f"oidc-issuer {pub['oidc-issuer']} is not under public-url {pub['public-url']}")
+mounts = {m["mountPath"]: m["name"] for m in dex_pod["containers"][0]["volumeMounts"]}
+vols = {v["name"]: v for v in dex_pod["volumes"]}
+for path, cm in (("/etc/dex", "dex-config"), ("/srv/dex/web/themes/gocart", "dex-theme")):
+    v = vols.get(mounts.get(path), {})
+    if v.get("configMap", {}).get("name") != cm:
+        problems.append(f"Dex does not mount ConfigMap {cm} at {path}")
+if "/tmp" not in mounts:
+    problems.append("Dex has no writable /tmp: its image renders the config template there, and the root filesystem is read-only")
+theme_files = {f.split("/")[-1] for g in base_k["configMapGenerator"] if g["name"] == "dex-theme" for f in g["files"]}
+if not {"styles.css", "logo.png", "favicon.png"} <= theme_files:
+    problems.append("the dex-theme ConfigMap lacks styles.css, logo.png or favicon.png")
+for f in re.findall(r"url\(\"?([\w.-]+\.woff2)", (ROOT/"base/dex/theme/styles.css").read_text()):
+    if f not in theme_files:
+        problems.append(f"the Dex theme uses font {f}, which is not in the dex-theme ConfigMap")
+# compose gives Dex the same variables
+compose = yaml.safe_load((ROOT/"../../docker-compose.yml").read_text())
+cenv = set(compose["services"]["dex"]["environment"])
+for name in sorted(wanted - cenv):
+    problems.append(f"dex/config.yaml reads {name}, which docker-compose.yml does not give Dex")
+if ("./infra/k8s/base/dex/config.yaml:/etc/dex/config.yaml:ro" not in compose["services"]["dex"]["volumes"]):
+    problems.append("docker-compose.yml does not mount the shared Dex config")
+if pub["admin-emails"] and not pub["admin-emails"].strip():
+    problems.append("admin-emails is blank")
+host = pub["public-url"].split("://", 1)[1].split(":")[0]
+
+# The edge layer is Traefik and cert-manager CRDs, which the Kubernetes schemas
+# do not know, so check what matters by hand: routes land on real Services and
+# ports, every middleware they name exists, the certificate covers the host and
+# lands in the Secret the routes serve.
+edge = {(d["kind"], d["metadata"]["name"]): d for d in docs(ROOT/"edge/edge.yaml")}
+cert = edge.get(("Certificate", "gocart-tls"))
+if not cert or host not in cert["spec"]["dnsNames"]:
+    problems.append(f"edge: the certificate does not cover {host}")
+elif cert["spec"]["issuerRef"]["name"] not in {d["metadata"]["name"] for d in docs(ROOT/"cert-manager/clusterissuers.yaml")}:
+    problems.append(f"edge: the certificate asks for issuer {cert['spec']['issuerRef']['name']}, which cert-manager/clusterissuers.yaml does not define")
+for (kd, nm), d in edge.items():
+    if kd != "IngressRoute":
+        continue
+    if d["spec"].get("tls", {}).get("secretName") != (cert or {}).get("spec", {}).get("secretName"):
+        problems.append(f"IngressRoute/{nm} serves a different TLS Secret than the certificate writes")
+    if d["spec"]["entryPoints"] != ["websecure"]:
+        problems.append(f"IngressRoute/{nm} is reachable without TLS")
+    for r in d["spec"]["routes"]:
+        if f"Host(`{host}`)" not in r["match"]:
+            problems.append(f"IngressRoute/{nm}: rule {r['match']} is not for host {host}")
+        for m in r.get("middlewares", []):
+            if ("Middleware", m["name"]) not in edge:
+                problems.append(f"IngressRoute/{nm}: uses Middleware {m['name']}, which is not defined")
+        for sv in r["services"]:
+            svc = by_kind.get(("Service", sv["name"]))
+            if not svc:
+                problems.append(f"IngressRoute/{nm}: sends traffic to Service {sv['name']}, which does not exist")
+            elif sv["port"] not in {sp["name"] for sp in svc["spec"]["ports"]}:
+                problems.append(f"IngressRoute/{nm}: Service {sv['name']} has no port named {sv['port']}")
+        if "/auth" in r["match"] and not any(m["name"] == "gocart-limit-signin" for m in r.get("middlewares", [])):
+            problems.append(f"IngressRoute/{nm}: /auth is not behind the strict sign-in rate limit")
+if pub["public-url"].split("://")[0] != "https":
+    problems.append("public-url is not https: session cookies would not be Secure")
+
+# the REQUIRE_IDENTITY services must have a secret to verify with
+for nm in ("order-service", "cart-service"):
+    envs = {e["name"] for e in by_kind[("Deployment", nm)]["spec"]["template"]["spec"]["containers"][0]["env"]}
+    if not {"IDENTITY_SECRET", "REQUIRE_IDENTITY"} <= envs:
+        problems.append(f"{nm} does not require a signed identity")
+
 # 3. Kustomizations: every referenced path exists, images name real images, and
 #    the JSON-patch path used by the cassandra overlay resolves in the base.
 def kust(p): return yaml.safe_load((ROOT/p/"kustomization.yaml").read_text())
-for p in ["base", "cassandra", "overlays/local", "overlays/staging", "overlays/staging-cassandra"]:
+for p in ["base", "cassandra", "edge", "overlays/local", "overlays/local-https", "overlays/staging", "overlays/staging-cassandra"]:
     k = kust(p)
-    for r in k.get("resources", []):
+    for r in k.get("resources", []) + k.get("components", []):
         t = (ROOT/p/r).resolve()
         if not t.exists():
             problems.append(f"{p}: resource {r} does not exist")
@@ -190,7 +337,7 @@ for im in kust("overlays/staging-cassandra")["images"]:
     if im["newTag"] != version + "-cassandra":
         problems.append(f"overlays/staging-cassandra tag {im['newTag']} != {version}-cassandra")
 for (kd, nm), d in by_kind.items():
-    if kd == "Deployment":
+    if kd == "Deployment" and d["spec"]["template"]["spec"]["containers"][0]["image"].startswith("gocart/"):
         tag = d["spec"]["template"]["spec"]["containers"][0]["image"].rsplit(":", 1)[1]
         if tag != version:
             problems.append(f"base {nm} image tag {tag} != VERSION {version}")

@@ -1,0 +1,8 @@
+# The way in from outside the cluster: HTTPS through Traefik, with a certificate
+# from cert-manager and rate limits at the edge. A component, used only by the
+# `local-https` overlay, because it needs Traefik's and cert-manager's CRDs.
+# One-time setup of both: docs/operations.md.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - edge.yaml

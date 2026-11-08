@@ -1,4 +1,30 @@
-# Changes in 0.4.0 (from 0.3.0)
+# Changes in 0.5.0 (from 0.4.0)
+
+Adds real sign-in, a landing page, and an HTTPS edge. Before this, a customer id was a label kept in the browser and anyone could read anyone's cart or order by guessing an id.
+
+## New
+- **Sign-in with OpenID Connect**, handled by the web gateway (authorization code flow with PKCE; the ID token is checked for signature, issuer, audience, expiry and nonce). The session is a signed `HttpOnly` cookie, so no session store and any gateway replica can serve any request. Administrators are people whose verified email is on `ADMIN_EMAILS`; the admin key now lives only in the gateway.
+- **Ownership is enforced in the services.** The gateway adds a short-lived signed identity (`X-Gocart-Identity`) to calls to the Order and Cart services; they refuse a customer acting in someone else's name (`403`) and show another customer's order as `404`. `REQUIRE_IDENTITY=true` (compose, Kubernetes) makes the customer routes fail closed. The OpenAPI files document the header, `401` and `403`.
+- **Landing page** in the existing theme: a live price-list receipt, the real event history of an approved and a declined order, and the five services. The storefront browses publicly; cart, orders and the admin console need a sign-in. The admin-key box and the browser-stored customer id are gone.
+- **Dex** (compose and Kubernetes) as the identity provider, configured from the environment: "Log in with Google" and "Log in with GitHub" switch on when their client IDs are set (`.env.example`, `docs/operations.md`), so there are no accounts or passwords in the repository's default config. Three throwaway demo accounts (password published) stay available behind `DEX_DEMO_USERS=true`, which compose and the demo overlays turn on. The Dex login pages are restyled in the GoCart theme (`infra/k8s/base/dex/theme`), and the browser-tab icon is now the price tag instead of the old indigo cart.
+- **Kubernetes:** NetworkPolicies (default deny, then only real callers), HTTPS through Traefik with a cert-manager certificate and per-address rate limits (stricter on `/auth/`), as an opt-in `local-https` overlay (ingress-nginx was retired in March 2026), a self-signed issuer for local use and a Let's Encrypt example. `check-k8s.py` now also checks policies against who calls whom, that the routes, middlewares and certificate line up, and that the public address agrees across the gateway, Dex and the routes.
+- `scripts/mint.py` makes the signed values for tests; `smoke.sh` has 99 checks (17 new: anonymous refusals, ownership between customers through the gateway and directly on the services, admin access, CSRF, spoofed headers).
+
+## Compatibility
+- **Breaking for direct callers.** With `REQUIRE_IDENTITY=true` the Order and Cart customer routes need the identity header, so a script calling them directly needs `scripts/mint.py`. Without the flag, services run as before for local use. The gateway refuses to start without `PUBLIC_URL`, an OIDC issuer and the secrets.
+- New environment: `IDENTITY_SECRET` (32+ characters), `SESSION_SECRET`, `OIDC_*`, `PUBLIC_URL`, `ADMIN_EMAILS`. Compose and the overlays carry demo values.
+- On Kubernetes the shop is opened through Traefik (overlay `local-https`) at `https://gocart.localtest.me:8443`; a plain port-forward to the gateway no longer completes sign-in.
+
+## Numbers
+279 Go tests (331 with subtests, all with `-race`), 25 front-end tests.
+
+## Verified
+In the sandbox: all Go and front-end tests, type-check, lint, build, `check-k8s.py`, `smoke.sh` 99/99 on real processes, and the full sign-in flow in a real browser against a stand-in OIDC provider. **Not run anywhere yet:** Dex itself (its login templates with our theme and its config template were checked separately, see the README), Google and GitHub sign-in, Traefik, cert-manager, the NetworkPolicies, the Docker build of this version, CI.
+
+## Known limits (added to the architecture table)
+A session cannot be revoked before its 8 hours end; Dex's accounts and the demo secrets are for local use only.
+
+# Earlier: 0.4.0 (from 0.3.0)
 
 Adds a web storefront and admin console, served by a fifth service. Nothing in the four existing services changed. If you committed 0.3.0 to git first, `git diff` after unzipping shows exactly this.
 
@@ -18,3 +44,5 @@ Adds a web storefront and admin console, served by a fifth service. Nothing in t
 ## Verified
 In the sandbox: all Go tests, the front-end tests, type-check, lint and production build; the five real processes driven in a real browser; `check-k8s.py`. On the author's machine and in CI: the five images build and start under Compose, `smoke.sh` passes 82 of 82, `terraform validate` passes and the plan adds 16 resources, the Cassandra job and the full CI run are green, and the Cassandra staging flow runs on Kubernetes. The README table lists each part and who ran it.
 
+## Fixed after first build
+`frontend/scripts/clean-dist.mjs` failed inside the Docker build because the embed folder did not exist there yet. It now creates the folder first (found and fixed by the author).

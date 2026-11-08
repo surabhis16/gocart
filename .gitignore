@@ -1,5 +1,6 @@
 # local run data
 data/
+.env
 # built binaries
 /product-service/product-service
 /order-service/order-service
@@ -13,3 +14,4 @@ data/
 *.tfstate
 *.tfstate.*
 *.tfplan
+*.env

@@ -285,7 +285,7 @@ components:
       description: |
         The shop's own shared secret (`ADMIN_KEY`), sent as
         `Authorization: Bearer <key>`. It says "this is the shop's tooling", not
-        "this is customer X"; there are no customer logins yet.
+        "this is customer X"; the customer-facing services check identity instead.
   schemas:
     Product:
       type: object
