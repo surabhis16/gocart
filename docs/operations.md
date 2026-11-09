@@ -9,7 +9,7 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 | minikube + kubectl | local Kubernetes | free, open source |
 | Terraform (or OpenTofu) | infrastructure as code | free to use; Terraform is source-available (BSL), and **OpenTofu** is the open-source drop-in, where you type `tofu` for `terraform` |
 | GitHub Actions + ghcr.io | CI and the container registry | free for public repositories; private repositories get a free monthly allowance |
-| LocalStack, AWS | **not used** | see [Infrastructure as code](#infrastructure-as-code-unit-iii) |
+| Traefik, cert-manager, Dex | HTTPS edge and sign-in on Kubernetes | free, open source |
 
 ## Run it
 
@@ -19,7 +19,7 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 docker compose up --build
 ```
 
-Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>, Cart on <http://localhost:8083>, and the storefront on <http://localhost:3000> (the admin console is at `/admin`; the key is `dev-admin-key` unless you set `ADMIN_KEY`). The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
+Product is on <http://localhost:8080>, Order on <http://localhost:8081>, Payment on <http://localhost:8082>, Cart on <http://localhost:8083>, and the storefront on <http://localhost:3000> (sign in as `admin@gocart.test` to reach the admin console at `/admin`; services called directly use the admin key `dev-admin-key` unless you set `ADMIN_KEY`). The Product service seeds a small demo catalogue on first start, including two awkward items on purpose: a lamp with only 3 in stock, and a desk mat that is sold out.
 
 ```
 curl -s localhost:8080/products | python3 -m json.tool
@@ -41,7 +41,7 @@ You will see `OrderPlaced`, `StockReserved`, `PaymentCaptured`. The payment toke
 
 Three scripts exercise it end to end (use a fresh stack for `smoke.sh`: `docker compose down -v`):
 
-- `./scripts/smoke.sh`: 82 checks across all five services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), shipped then delivered, admin endpoints refused without the key, the gateway serving the app and refusing internal routes, metrics present.
+- `./scripts/smoke.sh`: 99 checks across all five services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), shipped then delivered, admin endpoints refused without the key, ownership (a stranger gets `403` on a cart and `404` on an order), the gateway's sign-in session and CSRF checks, the gateway serving the app and refusing internal routes, metrics present.
 - `./scripts/oversell-demo.sh`: 20 customers each click "buy" twice at the same instant, for 3 lamps. It checks that exactly 3 orders were confirmed, stock ended at 0, exactly 3 charges were taken and no double-click was charged twice. It sets the stock itself, so it can be re-run.
 - `./scripts/outage-demo.sh`: two acts. The Product service goes down mid-order, then the Payment service does; each time the order is accepted (`202`), and finishes by itself when the service returns, with stock reserved once and money taken once.
 
@@ -67,13 +67,13 @@ Data goes to `./data` in each directory. Configuration is by environment variabl
 make test
 ```
 
-Format check, `go vet` and the race detector for all five Go modules: 227 tests (276 counting subtests). The front end has its own (`cd web-service/frontend && npm test`, 20 tests, run in CI with type-check, lint and build). The Cassandra tests only compile with `-tags cassandra` and need a live Cassandra; see below.
+Format check, `go vet` and the race detector for all five Go modules: 279 tests (331 counting subtests). The front end has its own (`cd web-service/frontend && npm test`: 25 tests, run in CI with type-check, lint, build and a check that the generated API types match the specs). The Cassandra tests compile with `-tags cassandra` and run against a live Cassandra; see below.
 
-## Developer workspace (Unit IV)
+## Developer workspace
 
 **Coding standards** are enforced by the machine instead of by review comments: CI fails on anything `gofmt` would change, on `go vet` findings, and on any data race (`go test -race`). Each service is a standard Go layout: `main.go` for wiring, `internal/` for everything else, so nothing outside a service can import its internals.
 
-**A containerised environment locally** is `docker-compose.yml`. Each of the four Dockerfiles is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
+**A containerised environment locally** is `docker-compose.yml`. Each of the five Dockerfiles is a two-stage build: compile in `golang:1.24-alpine`, then copy the single static binary into `scratch`, an empty image with no shell, no package manager and nothing to patch. Because there is no `curl` in such an image, each binary carries its own `-healthcheck` flag, which is what the `HEALTHCHECK` instruction and the compose health condition call. Containers run as a non-root user, and data lives in named volumes.
 
 ### Cassandra
 
@@ -87,17 +87,13 @@ This builds the Order service with `-tags cassandra`, starts a single Cassandra 
 
 How the Cassandra store works is in `order-service/internal/eventstore/cassandra.go`: one partition per order, one row per event, and `INSERT ... IF NOT EXISTS` (a lightweight transaction) so that of any number of writers racing to append the same version of the same order, exactly one wins.
 
-> **Read this about verification.** The Cassandra store is the one part of this project I could not compile against the real driver or run: my build environment could not download Go modules or pull images. I type-checked the code against a stub of the driver API, and the file store and Cassandra store are held to *one shared test suite* (`contract_test.go`). The CI job `cassandra-event-store` compiles it against the real driver and runs that suite against a live Cassandra. **Until that job is green, treat the Cassandra store as untested.** To run it yourself:
->
-> ```
-> docker run -d --name cass -p 9042:9042 cassandra:5.0      # wait about a minute
-> cd order-service
-> go get github.com/apache/cassandra-gocql-driver/v2@v2.0.0 && go mod tidy
-> go vet -tags cassandra ./...
-> CASSANDRA_TEST_HOSTS=127.0.0.1 go test -tags cassandra -v -run Cassandra ./internal/eventstore
-> ```
->
-> If `go vet -tags cassandra` reports a signature mismatch against the driver, that is the thing to fix, and it will point at the exact line.
+**Verified.** The file store and the Cassandra store are held to *one shared test suite* (`contract_test.go`): append, optimistic-concurrency conflicts, ordering, replay and concurrent writers racing for the same version. The CI job `cassandra-event-store` compiles the store against the real driver and runs that suite on a live Cassandra, and the `staging-cassandra` overlay runs it on Kubernetes with two Order replicas. To run the suite yourself:
+
+```
+docker run -d --name cass -p 9042:9042 cassandra:5.0      # wait about a minute
+cd order-service
+CASSANDRA_TEST_HOSTS=127.0.0.1 go test -tags cassandra -v -run Cassandra ./internal/eventstore
+```
 
 ### Kubernetes
 
@@ -108,6 +104,8 @@ Two ways to run on a local cluster, both under `infra/k8s/` and built with Kusto
 | `overlays/local` | Docker Desktop's Kubernetes, or minikube with `minikube image load` | images already on the node |
 | `overlays/staging` | minikube, the full shipping flow below | a registry inside the cluster |
 | `overlays/staging-cassandra` | staging, plus Cassandra and the Order service switched over | same |
+| `overlays/local-https` | local cluster with the Traefik front door, cert-manager certificate and Dex sign-in | images already on the node |
+| `overlays/local-https-private.example` | a template for your own Google and GitHub settings on top of `local-https` | as `local-https` |
 
 ```
 docker compose build
@@ -117,16 +115,16 @@ kubectl -n gocart-local get pods
 
 The manifests make a few choices on purpose; each is commented in the YAML:
 
-- **One replica each, with a `Recreate` rollout.** State is a file with one writer; see the [limits table](architecture.md#known-limits). The exception is `staging-cassandra`, which runs **two Order replicas** with a `RollingUpdate` (no volume, nothing on disk to protect). They stay consistent through the change feed; tune it with `SYNC_INTERVAL` (default 2s) and `RESYNC_INTERVAL` (default 5m). To see it: `kubectl -n gocart-staging get pods -l app.kubernetes.io/name=order-service`, place orders, and read them back repeatedly: both replicas answer, and `GET /orders/{id}` is always right.
+- **One replica each, with a `Recreate` rollout.** State is a file with one writer. The exception is `staging-cassandra`, which runs **two Order replicas** with a `RollingUpdate` (no volume, nothing on disk to protect). They stay consistent through the change feed; tune it with `SYNC_INTERVAL` (default 2s) and `RESYNC_INTERVAL` (default 5m). To see it: `kubectl -n gocart-staging get pods -l app.kubernetes.io/name=order-service`, place orders, and read them back repeatedly: both replicas answer, and `GET /orders/{id}` is always right.
 - **The Order service's readiness probe checks neither the Product nor the Payment service.** If it did, an outage of either would take Order out of rotation, and the whole design is that Order keeps accepting orders during one.
 - **The admin key and the sign-in secrets come from Secrets**, never from a literal in a Deployment. The `local` and `staging` overlays generate them from demo values; see [Admin key](#admin-key-and-metrics) and [Sign-in, secrets and the edge](#sign-in-secrets-and-the-edge).
 - **Only the gateway is reachable, and only through the ingress.** NetworkPolicies deny all inbound traffic, then allow the ingress controller to reach the gateway and Dex, and each service to be reached only by its real callers.
 - **Hardened pods:** non-root, read-only root filesystem, all capabilities dropped, default seccomp profile, resource limits.
 - **Cassandra** is a one-node StatefulSet with a headless Service and a volume claim template.
 
-`python3 scripts/check-k8s.py` validates all of it without a cluster: every object against the Kubernetes 1.31 API schemas (unknown fields are errors), then selector/label matches, probe ports, Service targets, overlay references and image tags against `VERSION`.
+`python3 scripts/check-k8s.py` validates all of it without a cluster: all 27 objects against the Kubernetes 1.31 API schemas (unknown fields are errors), then selector and label matches, probe ports, Service targets, overlay references, image tags against `VERSION`, that every service caller is admitted by a NetworkPolicy, that the public address agrees between the gateway, Dex and the route, the Dex environment and theme, the edge objects.
 
-## Infrastructure as code (Unit III)
+## Infrastructure as code
 
 ### DevOps principles, in this repository
 
@@ -143,7 +141,7 @@ The manifests make a few choices on purpose; each is commented in the YAML:
 
 `infra/terraform/` describes what GoCart would need from AWS: a container registry (ECR) and a log group (CloudWatch) for each of the five services, and one IAM policy that grants a CI job the minimum needed to push images and nothing else. ECR repositories are `IMMUTABLE` (a tag names one image forever, so "what is running in staging?" always has an answer), scan on push, and expire all but the newest ten images.
 
-There is deliberately **no VPC, load balancer or cluster**. Those are the expensive parts of AWS, and this project runs on a laptop. The practice, which is what Unit III teaches, is infrastructure described in files, reviewed, planned, and applied by a pipeline.
+The configuration covers what the services need from a registry and a log sink, and leaves the cluster itself to Kubernetes. Infrastructure is described in files, reviewed, planned and applied by a pipeline.
 
 **You can run `plan` for free with no AWS account.** The `offline` variable (default `true`) gives the AWS provider throw-away credentials and tells it not to look anything up. Nothing in the configuration reads from AWS, so the plan is complete:
 
@@ -160,22 +158,23 @@ terraform validate
 terraform plan -var offline=true
 ```
 
-The plan shows 16 resources to add: 5 repositories, 5 lifecycle policies, 5 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). That is the real output of `terraform plan -var offline=true`.
+The plan shows 16 resources to add: 5 repositories, 5 lifecycle policies, 5 log groups and 1 IAM policy (the policy document is a data source, computed locally, so it is not counted). 
 
-> **What is verified.** `terraform validate` passes and `terraform plan -var offline=true` produces the 16 additions above, run by the author; CI runs `fmt -check`, `init`, `validate` and `plan` on every push and is green. Applying to real AWS needs an account and `-var offline=false`; that has not been done and nothing here claims the configuration applies cleanly. Free-tier LocalStack was not used, because I could not confirm that its free edition supports ECR.
+**Verified.** `terraform validate` passes and `terraform plan -var offline=true` produces the 16 additions above. CI runs `fmt -check`, `init`, `validate` and `plan` on every push. To apply to a real AWS account, use `-var offline=false`.
 
 ### The pipeline
 
-`ci.yml` runs four jobs on every push and pull request:
+`ci.yml` runs five jobs on every push and pull request:
 
 | Job | What it checks |
 |---|---|
 | `test` | per service: `gofmt`, `go vet`, `go test -race` (including the OpenAPI drift test) |
 | `cassandra-event-store` | compiles the Cassandra store and runs the shared contract suite against a live Cassandra |
+| `frontend` | type-check, lint, tests, production build, generated API types up to date |
 | `infrastructure` | `terraform fmt/validate/plan`, the Kubernetes check, both compose files |
-| `end-to-end` | builds the four images, starts the stack, runs `smoke.sh`, the oversell demo, then the outage demo |
+| `end-to-end` | builds the images, starts the stack, runs `smoke.sh`, the oversell demo, then the outage demo |
 
-## Releasing (Unit V)
+## Releasing
 
 ### The staging environment, shipping and deploying
 
@@ -188,17 +187,17 @@ This is the whole path from source to a running staging environment:
 1. confirms the manifests agree on the version in `VERSION`;
 2. enables minikube's `registry` addon, a registry running inside the cluster;
 3. opens it on `localhost:5000` on your machine;
-4. builds the four images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
+4. builds the five images, tags them `localhost:5000/gocart/<service>:<version>`, and pushes them;
 5. applies the `staging` overlay into the `gocart-staging` namespace, which makes the cluster pull the *same name* from its own registry;
 6. waits for each rollout, then prints how to reach it.
 
 Then `./scripts/smoke.sh` against the forwarded ports, or the outage demo using `kubectl scale` as the way to take Product and Payment away (the exact commands are printed).
 
-For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build all four images and publish them to GitHub's free container registry, `ghcr.io`.
+For a release outside your machine, pushing a tag such as `v0.2.0` makes `release.yml` build all five images and publish them to GitHub's free container registry, `ghcr.io`.
 
-`scripts/bump-version.sh 0.2.0` changes the version everywhere it is written (the `VERSION` file, the manifests, the compose defaults) and re-runs the consistency check. Left to hand edits, those drift apart and staging quietly runs a different image than the one you just shipped. I tested it by bumping up, bumping back, and confirming the tree is byte-identical to where it started.
+`scripts/bump-version.sh 0.2.0` changes the version everywhere it is written (the `VERSION` file, the manifests, the compose defaults) and re-runs the consistency check. Left to hand edits, those drift apart and staging quietly runs a different image than the one you just shipped. A bump up followed by a bump back leaves the tree byte-identical.
 
-> **Verified.** `ship.sh` has been run end to end for the Cassandra staging flow by the author, and passes `shellcheck` and `bash -n`. The most likely thing to need adjusting on another machine is the registry port-forward, which behaves slightly differently across operating systems and minikube drivers; the comments in the script explain the mechanism so you can debug it.
+**Verified.** `ship.sh` runs end to end for the Cassandra staging flow and passes `shellcheck` and `bash -n`. The registry port-forward behaves slightly differently across operating systems and minikube drivers; the comments in the script explain the mechanism.
 
 ### Clean up
 
@@ -208,7 +207,7 @@ For a release outside your machine, pushing a tag such as `v0.2.0` makes `releas
 
 Deletes the `gocart-staging` and `gocart-local` namespaces (which removes Deployments, Services, volumes and Cassandra with them), stops the registry port-forward, removes the local images, and runs `docker compose down -v`. "Clean up" should leave nothing running.
 
-## Managing change (Unit V)
+## Managing change
 
 Changes to a microservices system are mostly changes to *contracts* between services, since each service's insides can change freely. Here are the kinds of change, and what GoCart does for each.
 
@@ -254,7 +253,7 @@ Every operation that crosses a network is idempotent, which turns "the network l
 
 Some operations are not for customers: shipping an order, reading an order's raw event log, creating or restocking products, looking up a charge. Those require `Authorization: Bearer <ADMIN_KEY>`. Without the header, or with the wrong key, the answer is `401`. A service started with **no** `ADMIN_KEY` refuses every admin request rather than leaving them open, and says so in its log. The key is compared in constant time.
 
-This is a shared secret, which is the simplest thing that is honestly better than nothing. It is not per-user authentication, and it does not authenticate the Order service to the Payment service: the charge and void endpoints are open to anyone who can reach the Payment service's port. In a cluster, a NetworkPolicy would restrict that port to the Order service's pods; a service mesh would make it mutual TLS. Both are out of scope, and listed in the [known limits](architecture.md#known-limits).
+The admin key protects the service-to-service admin endpoints; people reach the admin console by signing in, and the gateway alone holds the key. The Payment service's charge and void endpoints are reachable only from the Order service's pods. The Order and Cart services already verify who is asking; the NetworkPolicies in the Kubernetes base restrict every service to its real callers.
 
 Compose and the Kubernetes overlays use the demo value `dev-admin-key`. **Do not use it anywhere real.** To use your own:
 
@@ -291,11 +290,11 @@ kubectl apply -k infra/k8s/overlays/local-https
 kubectl -n traefik port-forward svc/traefik 8443:443
 ```
 
-Then open <https://gocart.localtest.me:8443> (that name always resolves to 127.0.0.1; the browser warns once about the self-signed certificate). The shop must be opened at this address: the gateway's `PUBLIC_URL`, Dex's issuer and redirect URI, and the route's host have to agree, and `check-k8s.py` fails if they do not. The plain `local` and `staging` overlays have no front door: they are for `ship.sh` and `smoke.sh`, which call the services directly. Port-forwarding to the `web-service` Service serves the pages there, but sign-in cannot complete, because the browser is sent to the public address.
+Then open <https://gocart.localtest.me:8443> (that name always resolves to 127.0.0.1; the browser warns once about the self-signed certificate). The shop must be opened at this address: the gateway's `PUBLIC_URL`, Dex's issuer and redirect URI, and the route's host have to agree, and `check-k8s.py` fails if they do not. The plain `local` and `staging` overlays have no front door: they are for `ship.sh` and `smoke.sh`, which call the services directly. Reach the shop through the front door: the browser is sent to the public address during sign-in.
 
-Traefik rate-limits each client address (a steady 20 requests a second with bursts to 60, and 2 a second with bursts to 10 on `/auth/`; see `infra/k8s/edge/edge.yaml`) and caps request bodies at 64 KiB. To try it: `for i in $(seq 60); do curl -sk -o /dev/null -w '%{http_code} ' https://gocart.localtest.me:8443/auth/login; done` and watch `429` appear.
+Traefik rate-limits each client address (a steady 20 requests a second with bursts to 60, and 2 a second with bursts to 10 on `/auth/`; see `infra/k8s/edge/edge.yaml`) and caps request bodies at 64 KiB. To see it: `for i in $(seq 60); do curl -sk -o /dev/null -w '%{http_code} ' https://gocart.localtest.me:8443/auth/login; done` and watch `429` appear.
 
-**Kubernetes does not read `.env`.** That file only feeds docker compose. In the cluster the same settings live in the `gocart-auth` Secret (the secrets and the four Google and GitHub values) and the `gocart-public` ConfigMap (`dex-demo-users`, `admin-emails`, `signin-hint`), and the `local` and `staging` overlays create both with demo values. Do not patch them by hand: the next `kubectl apply -k` puts the demo values back. Instead keep your own values in a private overlay that is applied on top:
+**Kubernetes does not read `.env`.** That file only feeds Docker Compose. In the cluster the same settings live in two objects the overlays create with demo values: the `gocart-auth` Secret (the signing secrets, plus `google-client-id`, `google-client-secret`, `github-client-id`, `github-client-secret`) and the `gocart-public` ConfigMap (`dex-demo-users`, `admin-emails`, `signin-hint`). Register the Google and GitHub apps as for Compose, but with your public address: the callback is `https://<your host>/dex/callback` (locally `https://gocart.localtest.me:8443/dex/callback`). Then keep your own values in a private overlay applied on top, so a later `kubectl apply -k` does not put the demo values back:
 
 ```
 cp -r infra/k8s/overlays/local-https-private.example infra/k8s/overlays/local-https-private
@@ -304,39 +303,9 @@ cp secrets.env.example secrets.env && cp public.env.example public.env   # fill 
 cd - && kubectl apply -k infra/k8s/overlays/local-https-private
 ```
 
-`secrets.env` and `public.env` are ignored by git. The pods roll by themselves, because Kustomize renames the generated Secret and ConfigMap when their contents change. For a staging cluster, make the same overlay on top of `staging`.
+The overlay merges `secrets.env` (the four Google and GitHub values) into `gocart-auth` and `public.env` (`dex-demo-users=false`, `admin-emails=you@example.com`) into `gocart-public`. `.gitignore` excludes `*.env`, so the values never reach git; each teammate keeps their own. The pods roll by themselves, because Kustomize renames the generated Secret and ConfigMap when their contents change. For a staging cluster, make the same overlay on top of `staging`.
 
-**Google and GitHub on Kubernetes (Kubernetes does not read `.env`).** The `.env` file only feeds Docker Compose. In the cluster the same settings live in two objects the overlay creates with demo values: the `gocart-auth` Secret (the signing secrets, plus `google-client-id`, `google-client-secret`, `github-client-id`, `github-client-secret`) and the `gocart-public` ConfigMap (`dex-demo-users`, `admin-emails`, `signin-hint`). Editing `.env` therefore changes nothing there, and Dex shows no Google or GitHub buttons until the Secret holds the keys.
-
-Register the same two apps as for compose, but with your public address: the callback is `https://<your host>/dex/callback` (locally `https://gocart.localtest.me:8443/dex/callback`). Then keep your real values in a **private overlay** that sits on top of the shared one, instead of patching live objects (a later `kubectl apply -k` would put the demo values back):
-
-```
-infra/k8s/overlays/local-https-private/
-  kustomization.yaml
-  secrets.env      # google-client-id=...  google-client-secret=...  github-client-id=...  github-client-secret=...
-  public.env       # dex-demo-users=false  and  admin-emails=you@example.com
-```
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources:
-  - ../local-https
-secretGenerator:
-  - name: gocart-auth
-    behavior: merge
-    envs:
-      - secrets.env
-configMapGenerator:
-  - name: gocart-public
-    behavior: merge
-    envs:
-      - public.env
-```
-
-`kubectl apply -k infra/k8s/overlays/local-https-private` then regenerates both objects, updates the hashed ConfigMap name in the Deployments, and the pods that read them restart by themselves. `.gitignore` excludes `*.env`, so the secrets never reach git; do not commit the two `.env` files, and give each teammate their own. If you must patch live objects instead, remember that Kustomize adds a hash to the ConfigMap's name (`kubectl get cm` shows the real one), that pods read environment variables only when they start (restart the Deployments), and that the next apply will overwrite your patch. In `staging`, which `ship.sh` deploys, do the same with a private overlay on top of `staging`.
-
-The `local` and `staging` overlays are demos: they switch the throwaway accounts on (`dex-demo-users=true`) and name `admin@gocart.test` the administrator, which a private overlay replaces.
+The `local` and `staging` overlays switch the demo accounts on (`dex-demo-users=true`) and name `admin@gocart.test` the administrator; a private overlay replaces both.
 
 **Secrets.** Three values sign and verify: `IDENTITY_SECRET` (shared by the gateway, Order and Cart; at least 32 characters, or the service refuses to start), `SESSION_SECRET` (the gateway only) and `OIDC_CLIENT_SECRET` (the gateway and Dex). The demo values are literals in compose and the overlays. For anything real:
 
@@ -347,7 +316,7 @@ kubectl -n gocart-staging create secret generic gocart-auth \
   --from-literal=oidc-client-secret="$(openssl rand -hex 24)" --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-and remove the `gocart-auth` generator from the overlay. Changing `SESSION_SECRET` signs everyone out; changing `IDENTITY_SECRET` needs the gateway, Order and Cart restarted together. **Real use** means turning the demo accounts off and signing in through Google or GitHub (above), or pointing the gateway at another OIDC provider directly (set `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `ADMIN_EMAILS`), a real hostname with `letsencrypt.example.yaml` in place of the self-signed issuer, and keeping the secrets in an external store rather than in the overlay.
+and remove the `gocart-auth` generator from the overlay. Changing `SESSION_SECRET` signs everyone out; changing `IDENTITY_SECRET` needs the gateway, Order and Cart restarted together. **For a public deployment**, turn the demo accounts off, sign in through Google or GitHub (above), or point the gateway at another OIDC provider directly (set `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `ADMIN_EMAILS`), use a real hostname with `letsencrypt.example.yaml` in place of the self-signed issuer, and keep the secrets in an external store.
 
 **Calling the services by hand** (for debugging) now needs an identity: `scripts/mint.py identity "$IDENTITY_SECRET" cust_x` prints the header value to send as `X-Gocart-Identity`. `smoke.sh` does this for you; set `IDENTITY_SECRET=` (empty) to run it against services started without sign-in.
 
@@ -361,9 +330,9 @@ curl -s localhost:8081/metrics | grep gocart_
 
 The two to watch are in the Order service: `gocart_orders_pending_work` with `kind` `placed` or `awaiting_payment` (something downstream is unavailable), and with `kind` `stock_release` or `refund` (a compensation is not landing). All four are the reconciler's backlog, and all should drain to zero.
 
-## Measuring progress (Unit V)
+## Measuring progress
 
-The syllabus asks how to tell whether adopting microservices is working. The honest answer is to measure *flow and coordination*, not the number of services. The four standard delivery metrics (from the DORA research), and where each comes from in this repository:
+Whether microservices are working shows up in *flow and coordination*, not in the number of services. The four standard delivery metrics (from the DORA research), and where each comes from in this repository:
 
 | Metric | What it tells you | Source here |
 |---|---|---|
@@ -377,8 +346,8 @@ And two that matter specifically for *this* architecture, because reducing coord
 - **Cross-team changes per release:** how many releases needed more than one team to change something. It should trend towards zero, and a service whose changes always drag another service along is the sign of a boundary in the wrong place.
 - **Splits and merges:** per the sizing formula, a healthy system keeps splitting where coordination hurts. Track *why* each boundary moved.
 
-A team that ships twice a day to four services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
+A team that ships twice a day to five services, and almost never has to ask the other team before doing so, has made progress. One that has twenty services and a weekly joint release has not.
 
 ## Complexity and simplification
 
-Microservices do not remove complexity, they move it: from inside a codebase to between services, where it is harder to see. GoCart's wager is that three services is the least that demonstrates the benefits (the third, Payment, is where the cost became real), and the cost is visible in the code: the saga and its compensations, the reconciler, idempotency, tombstones and retries are exactly the complexity that a single process gets for free from a transaction. Anything added to a boundary should earn its place against that bill.
+Microservices do not remove complexity, they move it: from inside a codebase to between services, where it is harder to see. GoCart's wager is that a handful of services is the least that shows the benefits, and the cost is visible in the code: the saga and its compensations, the reconciler, idempotency, tombstones and retries are exactly the complexity that a single process gets for free from a transaction. Anything added to a boundary earns its place against that bill.

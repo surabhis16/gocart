@@ -4,13 +4,42 @@
 
 Four services, each in its own bounded context, each owning its own data. The Order service coordinates the purchase: it calls `POST /reservations` and `DELETE /reservations/{order_id}` on the Product service, and `POST /charges` and `DELETE /charges/{order_id}` on the Payment service. The Cart service sits in front: it checks that a product exists (`GET /products/{id}`) and, at checkout, places an order (`POST /orders`). Product and Payment never talk to each other, and neither knows the other exists. Nothing calls the Cart service; it is the outermost edge, so a cart outage cannot hurt an order.
 
-## What makes these microservices (Unit I)
+## At a glance
+
+| Layer | What GoCart uses |
+|---|---|
+| Services | Five Go 1.22 services on the standard library alone: Product, Order, Payment, Cart and the Web gateway. Static binaries of about 6.5 MB in `scratch` images |
+| Patterns | Event sourcing and CQRS (Order), a saga with compensations and a reconciler, idempotency keys end to end, optimistic concurrency, a tombstone for late charges |
+| Storage | A private store per service: atomic JSON snapshots (Product, Payment, Cart), an append-only event log (Order) that can be a file or Cassandra |
+| Contracts | OpenAPI 3.0.3 for every service, RFC 9457 problem documents, route-drift tests, front-end types generated from the specs |
+| Identity | OpenID Connect with PKCE (Dex, which fronts Google and GitHub), signed stateless session cookies, a short-lived signed identity the gateway passes to the services, ownership checks where the data lives |
+| Front end | React 19, TypeScript, Vite, Tailwind, TanStack Query, React Router, embedded into the gateway binary |
+| Packaging | Multi-stage Docker builds, Docker Compose, Kustomize overlays for Kubernetes |
+| Edge and network | Traefik with a cert-manager certificate, per-address rate limits, NetworkPolicies that admit only real callers |
+| Infrastructure as code | Terraform for ECR repositories, CloudWatch log groups and a least-privilege CI policy |
+| Delivery | GitHub Actions (test matrix, Cassandra, front end, infrastructure, end-to-end), a release workflow to `ghcr.io`, one-command version bumps and staging deploys |
+| Observability | Structured JSON logs, a request id carried across all five services, Prometheus metrics on every service |
+
+### How a request travels
+
+```
+ Browser ──HTTPS──▶ Traefik ──▶ Web gateway ──┬──▶ Product  (catalogue, stock, reservations)
+ (React app)   cert-manager     OIDC sign-in  ├──▶ Cart     (what a customer intends to buy)
+               rate limits      sessions      ├──▶ Order    (event-sourced orders, saga)
+                    │           allow-list    └──▶ Payment  (charges; mock card network)
+                    ▼                              Order ──▶ Product, Payment
+                   Dex ◀── Google / GitHub         Cart  ──▶ Product, Order
+```
+
+The browser never reaches a service directly. NetworkPolicies mean a service accepts traffic only from its real callers, and the Order and Cart services verify who is asking on every customer route.
+
+## What makes these microservices
 
 A service earns the name by being changeable and deployable without asking anyone else. In GoCart that is concrete:
 
 - **Separate modules.** `product-service/`, `order-service/`, `payment-service/` and `cart-service/` have their own `go.mod`, their own Dockerfile and their own tests. None imports another. Each builds and tests from its own directory, and CI runs them as separate matrix jobs.
 - **No shared code.** The request-ID, problem-document, metrics and admin-key helpers are a few hundred stable lines and appear in each service. That duplication is deliberate: a shared library would mean a change to it forces every service to release together, which is exactly the coordination cost the architecture exists to avoid. Duplicating a few hundred stable lines is cheaper than that coupling.
-- **No shared data.** See [Data](#data-unit-ii).
+- **No shared data.** See [Data](#data).
 - **One coordination point, written down.** The Order service's whole understanding of the Product service lives in one file, `order-service/internal/productclient/client.go`, and of the Payment service in another, `internal/paymentclient/client.go`. The contracts they rely on are [`openapi/product.yaml`](openapi/product.yaml) and [`openapi/payment.yaml`](openapi/payment.yaml).
 
 **Reducing coordination costs** is the argument behind all of that. Coordination between teams is the thing that does not scale: every meeting to agree a change, every release train, every "can you deploy before us". The design goal is to shrink what two teams must agree on to a small, explicit, versioned contract.
@@ -29,9 +58,9 @@ Using the four team types and three interaction modes from *Team Topologies* (Sk
 
 Two additions in practice. For the first few weeks, while the reservation contract is still being found, Checkout and Catalog would use **collaboration** mode, working side by side; once it settles it hardens into X-as-a-Service, and that is the moment to freeze `openapi/product.yaml` behind versioning. And Platform's job is to make the right thing the easy thing: `scripts/ship.sh` and the CI workflows are that, in miniature.
 
-This project has one author, so one person wears all four hats. The point of writing the topology down is that the *code* is already split along these lines: if four people did take it over tomorrow, nobody would need to change the architecture first.
+The topology is written down because the *code* is already split along these lines: separate teams could take ownership of these services without changing the architecture first.
 
-## Boundaries (Unit II)
+## Boundaries
 
 ### Domain-driven design
 
@@ -51,24 +80,10 @@ The Payment context is a third answer to "what is an order?": to it, an order is
 
 The snapshot row is the one to dwell on. If the Order service stored a product's current price and looked it up later, a price change would silently rewrite an old order. Instead the Product service returns name and price *at the moment of reservation*, and the order keeps that copy. Two contexts hold "the price", and that duplication is correct: they are answering different questions (what does it cost now / what did this customer agree to pay).
 
-### Event storming
 
-Event storming starts from what *happens*, in past tense, on sticky notes, and works backwards to commands and the things that decide them. The outcome for GoCart:
+### Sizing the services
 
-| Kind | Items |
-|---|---|
-| **Domain events** (orange) | OrderPlaced, StockReserved, OrderRejected, PaymentCaptured, PaymentDeclined, ReservationExpired, OrderCancelled, StockReleased, PaymentRefunded, OrderShipped |
-| **Commands** (blue) | Place order, Cancel order, Ship order |
-| **Aggregate** (yellow) | Order (decides every command above; its stream of events is its state) |
-| **Policies** (lilac): "whenever X, then Y" | whenever OrderPlaced, reserve stock · whenever StockReserved, charge the customer · whenever PaymentDeclined, release stock · whenever ReservationExpired, release stock and void the charge · whenever OrderCancelled, release stock and refund |
-| **External systems** (pink) | Product service, Payment service (and behind it, the card network) |
-| **Hot spots** (red): the questions the session raised | What does the customer see if Product is down? What if they click twice? What if the price changes after they browse? What if the card is declined: is the stock held forever? What if the payment provider does not answer: was the customer charged? What if the customer abandons checkout? |
-
-The first three hot spots became the `202 Accepted` outcome and the reconciler, the `Idempotency-Key`, and the price snapshot. The payment ones, added when payments were, became the decline/unknown distinction, the idempotent charge, and the expiry with a void. The policies are the saga described below. They are the only places the Order service does something *because of* an event rather than because a user asked.
-
-### The universal sizing formula
-
-*Microservices: Up and Running* (Mitra and Nadareishvili) offers three principles in place of a numeric formula for "how big should a service be":
+Three principles in place of a numeric formula for "how big should a service be":
 
 1. **Start with just a few microservices**, using bounded contexts as the starting boundaries.
 2. **Keep splitting** as the system and its teams grow, guided by where coordination is hurting.
@@ -78,7 +93,7 @@ Applied here: four services is principle 1, one per bounded context, and no smal
 
 The likeliest first split, principle 2, would be **Catalog** (names, descriptions, prices: read-heavy, edited by merchandisers) away from **Inventory** (stock and reservations: write-heavy, changes every order). They change at different speeds and for different reasons, so they would eventually want different owners and release rhythms. The trigger is not "it feels big", it is "two teams keep waiting on each other to change this service". Until then, splitting is cost without benefit, and the splitting direction is easier to reverse than merging.
 
-## Data (Unit II)
+## Data
 
 ### Independent deployability and data sharing
 
@@ -91,7 +106,7 @@ There is no database that any two services share, and that is a design rule, not
 | Why that shape | a catalogue is state: nobody asks what the lamp's price was on a given Tuesday | an order is a story: what happened, in what order, matters | a ledger entry is looked up by key and answered the same way every time; the Order service already holds the story |
 | Recovery | crash-safe by construction: a reader sees the old file or the new, never half | a torn final write is detected and cut off at startup; corruption anywhere else refuses to start | as Product, and a corrupt ledger refuses to start rather than quietly forgetting what was charged |
 
-Choosing different storage for each service is the point: each picks what suits it. Cassandra, in the syllabus's Unit IV, suits the Order service's event log (append-heavy, partitioned by order), and the Order service can use it. See [operations.md](operations.md#cassandra).
+Choosing different storage for each service is the point: each picks what suits it. Cassandra suits the Order service's event log (append-heavy, partitioned by order), and the Order service can use it as its store. See [operations.md](operations.md#cassandra).
 
 ### Event sourcing and CQRS
 
@@ -118,7 +133,7 @@ What this buys, and where in the code:
 - **Command side:** `POST /orders`, `.../cancel`, `.../ship`, `.../deliver`. These load the order's events, replay them, decide, and append. They never read the projection.
 - **Query side:** `GET /orders`, `GET /orders/{id}`. These read `internal/projection`, a flat in-memory view with a by-customer index, shaped for the API instead of for decisions. They never replay events.
 
-*An honest qualifier:* the two sides share a process, and the view is updated right after each append, under a lock. That is CQRS with separate models, not with separate infrastructure. What does hold is the separation that matters: commands decide from the log, queries read the view, and the view can be rebuilt at any time.
+*Scope of the separation:* the two sides share a process, and the view is updated right after each append, under a lock. That is CQRS with separate models, not with separate infrastructure. What does hold is the separation that matters: commands decide from the log, queries read the view, and the view can be rebuilt at any time.
 
 **Running more than one Order replica** (Cassandra store). Each replica has its own view, so each must learn about orders the others handled. Appending an event also writes the order's id to a small `order_changes` table (bucketed by hour, ordered by timeuuid, expiring after a day). Every `SYNC_INTERVAL` (2s) a replica reads the ids changed since its last look, minus a 10s overlap, and replays just those streams into its view. Applying an event is idempotent per version, so overlap and duplicates are harmless. The feed is only a *hint*: every `RESYNC_INTERVAL` (5m) a replica reloads the whole log, so a lost feed row delays a view by minutes instead of leaving it wrong forever. Commands first catch up on the order they touch, and `GET /orders/{id}` falls back to the log when the view has not seen the order, so those two are never stale. A list (`GET /orders`) can trail another replica by up to `SYNC_INTERVAL`. That is the eventual consistency CQRS signs up for, stated rather than hidden. Both replicas run the reconciler; that is safe because every step it takes (reserve, charge, release, void) is idempotent per order. Covered by `internal/service/sync_test.go`, including a lost feed, a failed sync and concurrent load across replicas.
 
@@ -151,7 +166,7 @@ Several ways for an order to end leave something owed to another service. The or
 
 The two debts are independent. If the Payment service is down when an order is cancelled, the stock still goes back immediately and the refund is retried until it lands (`TestCancelWithPaymentDownStillReturnsTheStock`); with both services down, both debts are owed and both are paid when they return (`TestCancelWithBothServicesDownOwesBothAndPaysBothLater`). `stock_release_pending` and `refund_pending` on the order say which is still outstanding.
 
-This is demonstrated, not just described. `scripts/outage-demo.sh` runs two acts: the Product service goes down mid-order, then the Payment service does. Each time the customer gets `202`, the order finishes by itself when the service returns, and stock and money each move exactly once. In my run, with the reconciler polling every second, the event timestamps show `StockReserved` recorded 10.8 seconds after `OrderPlaced` (Act 1) and `PaymentCaptured` 10.9 seconds after `StockReserved` (Act 2): the 10-second grace period plus a fraction of a tick. At the default 5-second interval, expect up to about 15 seconds.
+This is demonstrated, not just described. `scripts/outage-demo.sh` runs two acts: the Product service goes down mid-order, then the Payment service does. Each time the customer gets `202`, the order finishes by itself when the service returns, and stock and money each move exactly once. With the reconciler polling every second, the event timestamps show `StockReserved` recorded 10.8 seconds after `OrderPlaced` (Act 1) and `PaymentCaptured` 10.9 seconds after `StockReserved` (Act 2): the 10-second grace period plus a fraction of a tick. At the default 5-second interval, recovery takes up to about 15 seconds.
 
 Retries are safe on every side of every call:
 
@@ -185,7 +200,7 @@ Cancelling needs care at one moment: an order is abandoned while its charge requ
 
 ### What is never stored
 
-A payment token is an opaque reference to a payment method, never a card number. The Order service refuses anything that is not shaped like `tok_` plus lowercase letters, digits and underscores, *before* writing the event, because an append-only log is the worst possible place for a card number: it can never be edited out. The Payment service applies the same rule independently. The token is kept in `OrderPlaced` so a payment that could not complete can be retried without asking the customer again; it is never returned by the API, and `GET /orders/{id}/events` strips it from the payload. (The log file itself does hold it. A real system would store a customer's saved payment-method id and let the provider own the secret.)
+A payment token is an opaque reference to a payment method, never a card number. The Order service refuses anything that is not shaped like `tok_` plus lowercase letters, digits and underscores, *before* writing the event, because an append-only log is the worst possible place for a card number: it can never be edited out. The Payment service applies the same rule independently. The token is kept in `OrderPlaced` so a payment that could not complete can be retried without asking the customer again; it is never returned by the API, and `GET /orders/{id}/events` strips it from the payload.
 
 ## Carts and checkout
 
@@ -214,29 +229,25 @@ The browser talks to one origin, the Web service, and never to the four services
 Three questions are kept apart: *who is this* (an identity provider answers), *may they do this* (each service answers, about its own data), and *who may reach this service at all* (the network answers).
 
 - **Sign-in is OpenID Connect, done by the gateway.** The browser is sent to the identity provider (Dex, which can also front Google and GitHub; any OIDC provider in principle, since GoCart only knows an issuer, a client id and a secret). It comes back with a one-time code, which the gateway swaps for an ID token and checks properly: RS256 only, signed by a key from the provider's published key set (refetched when a key rotates, at most every ten seconds), and the right issuer, audience, expiry and *nonce*. The authorization-code flow uses PKCE and a `state` check, so a response meant for someone else's login is refused.
-- **The session is a signed cookie, not a row in a table.** It holds the customer id, name, email and an expiry, is `HttpOnly`, `SameSite=Lax` and `Secure` over HTTPS, and is signed with a secret under a purpose label so a login-handshake cookie cannot be replayed as a session. Because nothing is stored, any gateway replica can serve any request. The cost is that a session cannot be revoked before it expires (8 hours); see the limits table. Changing requests also need an `X-Requested-With` header a cross-site form cannot send.
+- **The session is a signed cookie, not a row in a table.** It holds the customer id, name, email and an expiry, is `HttpOnly`, `SameSite=Lax` and `Secure` over HTTPS, and is signed with a secret under a purpose label so a login-handshake cookie cannot be replayed as a session. Because nothing is stored, any gateway replica can serve any request. Sessions last 8 hours, and the identity assertion sent on to the services lives only 30 seconds. Changing requests also need an `X-Requested-With` header a cross-site form cannot send.
 - **The customer id is derived, not typed**: a hash of the provider's issuer and the person's subject (`cust_` and 16 hex digits). People cannot choose it and two providers cannot collide.
 - **The gateway vouches for the person to the Order and Cart services.** It removes whatever `Cookie`, `Authorization` and identity header the browser sent, then adds a signed assertion (`X-Gocart-Identity`: the customer id, a role and a 30-second expiry, signed with a secret the gateway and the two services share). For an administrator (an email on the `ADMIN_EMAILS` list *with a verified address*) it also adds the shop's admin key, which only the gateway holds, so the browser never sees it.
 - **Each service enforces ownership of its own data.** A customer can place an order only in their own name (`403`), list only their own, and asks for someone else's order and gets `404`, as though it did not exist, so ids cannot be probed. A cart is the same, `403`. This is checked where the data lives, not only at the gateway, so a mistake in the gateway's allow-list cannot expose another person's order.
 - **Fail closed.** With `REQUIRE_IDENTITY=true` (compose and Kubernetes) a customer route with no assertion is `401`. Without it, a request with no assertion counts as trusted local use so a service can still be run by hand, but a *bad* assertion is always refused, and a service started with the flag but no secret refuses to start.
 - **The network is the second lock.** In Kubernetes, NetworkPolicies let only the ingress controller reach the gateway and Dex, and only the named callers reach each service, so no pod can call the Order service directly. `check-k8s.py` fails if a service calls another that its policy does not admit.
-- **The edge.** Traefik terminates HTTPS with a certificate cert-manager issues, and rate-limits per client address (`429`), with a tighter limit on `/auth/`. (ingress-nginx, the first choice, was retired in March 2026.) It is an opt-in layer, the `local-https` overlay, because it needs both controllers installed. Locally the certificate is self-signed (the browser warns once); for a real name, `infra/k8s/cert-manager/letsencrypt.example.yaml` has the Let's Encrypt issuers.
+- **The edge.** Traefik terminates HTTPS with a certificate cert-manager issues, and rate-limits per client address (`429`), with a tighter limit on `/auth/`. It is the `local-https` overlay. Locally the certificate is self-signed; for a real hostname, `infra/k8s/cert-manager/letsencrypt.example.yaml` has the Let's Encrypt issuers.
 
-## Known limits
+## Future scope
 
-Written down so they are choices you can defend rather than surprises:
-
-| Limit | Why it is acceptable here | What removing it would take |
-|---|---|---|
-| **One replica of Product and Payment; Order scales only on Cassandra.** | Product's and Payment's state is one file each (one writer), and Payment's one-charge-per-order guarantee relies on a lock inside the process. Order with the file store is the same. Order on Cassandra runs two replicas in `staging-cassandra`, synchronised by the change feed above, so its lists can lag by a couple of seconds. | Product and Payment: a real database that can enforce uniqueness across replicas. Order: a push-based feed (or a log with subscriptions) instead of polling. |
-| **One replica of the Cart service.** | Carts are one file with one writer. A lost cart costs a customer a minute, not money, and checkout's safety does not depend on the Cart service at all. | Carts in a shared store (Redis or Postgres). |
-| **A session cannot be revoked before it expires** (8 hours), and sign-out only clears the browser's cookie. | A signed cookie keeps the gateway stateless; the cost is that a stolen cookie works until it expires. The identity assertion sent to the services lives only 30 seconds. | A server-side session table (or a revocation list) the gateway checks, shared by its replicas. |
-| **Demo accounts are on by default locally; Dex keeps sessions in memory; the secrets in compose and the overlays are literals.** The three demo accounts share a published password, so `DEX_DEMO_USERS` must be false on anything shared. There is no sign-up form or password reset: people sign up by signing in with Google or GitHub, and GoCart stores no passwords. The same person using both Google and GitHub is two customers, because the id comes from the provider's account, not the email. | A first run needs no accounts anywhere, and Dex lets Google and GitHub in without GoCart holding credentials. | A real provider, and secrets from an external store that can rotate them ([operations.md](operations.md#sign-in-secrets-and-the-edge)). |
-| **A cart does not hold stock.** | Reserving stock for people who are only browsing starves buyers; the reservation happens at checkout, where the money is. The cost is that checkout can discover the stock has gone, and says so (`409`). | A short-lived reservation at add-to-cart, with its own expiry, which is a second saga to run. |
-| **The reconciler polls**, rather than being triggered. | Simple, and safe because every step it repeats is idempotent. Worst case is a delay of a few seconds. | A transactional outbox, which is more moving parts for a latency win nobody needs yet. |
-| **Product rewrites its whole snapshot on every change.** | Fine for a catalogue of thousands of rows; every mutation is atomic and crash-safe. | A database, once the catalogue outgrows a few MB. |
-| **Administrators are one shared key inside the services.** Shipping, delivering, stock changes, the event log and charge look-ups need `ADMIN_KEY`; people become administrators at the gateway (by verified email), which then presents the key. The Payment service's `POST /charges` and `DELETE /charges/{order_id}` are open to anyone who can reach its port, which is why a NetworkPolicy restricts it to the Order service and the gateway. | One key is simple and the browser never holds it. NetworkPolicies are enforced only where the cluster's network plugin supports them. | The services verifying the administrator's identity themselves (a role in the signed assertion is already there), per-person audit, and mutual TLS between services. |
-| **The payment provider is a mock, and the token is stored in the event log.** | There is no real money, and the token is an opaque test string. | A real provider integration with its own idempotency keys, webhooks for late outcomes, and saved payment-method ids instead of tokens. |
-| **Unpaid stock is held for a fixed time** (`PAYMENT_TTL`, 15 minutes), checked by the polling reconciler. | Simple, and safe: expiry also voids any in-flight charge. | A per-order timer or a delayed message, and a reservation that the Product service itself expires. |
-| **Startup replays the whole event log** to rebuild the read model. | Measured on generated logs, in this sandbox: 10,000 orders (20,000 events) start in about 0.17 s; 100,000 orders (200,000 events, 51 MB) in about 2.0 s. Linear, so a million orders would be around 20 s. | Snapshots in the read model, or a persisted projection. |
-| **Spec check compares routes, not schemas.** | See [seed.md](seed.md#5-specifications-in-an-open-standard). | An OpenAPI validator dependency. |
+| Area | Next step |
+|---|---|
+| **Scale-out** | Product, Payment and Cart move to a shared database so each can run several replicas (Order already runs two on Cassandra) |
+| **Data operations** | A managed database or Cassandra operator, scheduled backups, and a rehearsed restore |
+| **Payments** | A real provider such as Razorpay in test mode: webhooks for late outcomes, saved payment-method ids, reconciliation against the provider's records |
+| **Messaging** | A broker (NATS or Kafka) and a transactional outbox in place of the polling reconciler and change feed, plus a notifications service |
+| **Identity** | A server-side session table for instant sign-out, per-person admin roles verified by the services, mutual TLS between services |
+| **Secrets** | An external secrets manager with rotation, in place of Kubernetes Secrets |
+| **Observability** | Prometheus and Grafana dashboards with alerts, central logs, and OpenTelemetry traces built on the existing request id |
+| **Resilience** | Autoscaling, pod disruption budgets, and resource limits tuned from load tests |
+| **Delivery** | Image scanning and signing, and GitOps with Argo CD or Flux in place of `ship.sh`; applying the Terraform to a cloud account |
+| **Catalogue and carts** | A database for the catalogue as it grows; short-lived stock reservation when an item is added to a cart |

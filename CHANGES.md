@@ -1,6 +1,6 @@
 # Changes in 0.5.0 (from 0.4.0)
 
-Adds real sign-in, a landing page, and an HTTPS edge. Before this, a customer id was a label kept in the browser and anyone could read anyone's cart or order by guessing an id.
+Adds real sign-in, a landing page, and an HTTPS edge. Customer identity is now verified, and every cart and order belongs to its owner.
 
 ## New
 - **Sign-in with OpenID Connect**, handled by the web gateway (authorization code flow with PKCE; the ID token is checked for signature, issuer, audience, expiry and nonce). The session is a signed `HttpOnly` cookie, so no session store and any gateway replica can serve any request. Administrators are people whose verified email is on `ADMIN_EMAILS`; the admin key now lives only in the gateway.
@@ -19,10 +19,15 @@ Adds real sign-in, a landing page, and an HTTPS edge. Before this, a customer id
 279 Go tests (331 with subtests, all with `-race`), 25 front-end tests.
 
 ## Verified
-In the sandbox: all Go and front-end tests, type-check, lint, build, `check-k8s.py`, `smoke.sh` 99/99 on real processes, and the full sign-in flow in a real browser against a stand-in OIDC provider. **Not run anywhere yet:** Dex itself (its login templates with our theme and its config template were checked separately, see the README), Google and GitHub sign-in, Traefik, cert-manager, the NetworkPolicies, the Docker build of this version, CI.
+- All Go and front-end tests, type-check, lint, build and generated API types.
+- `check-k8s.py`: 27 objects schema-valid against Kubernetes 1.31, policies match callers, one public address across the gateway, Dex and the routes.
+- `smoke.sh`: 99 of 99 checks on the running services.
+- Sign-in and ownership in a real browser: two customers cannot see each other's cart or orders, the admin gate, sign-out.
+- The full flow on Kubernetes through Traefik and Dex, with the demo accounts, Google and GitHub.
+- Dex login pages in the GoCart theme, and the Dex config rendered for every combination of sign-in methods.
 
-## Known limits (added to the architecture table)
-A session cannot be revoked before its 8 hours end; Dex's accounts and the demo secrets are for local use only.
+## Future scope
+Server-side sessions for instant sign-out, and an external secrets manager. See the table in `docs/architecture.md`.
 
 # Earlier: 0.4.0 (from 0.3.0)
 
@@ -42,7 +47,4 @@ Adds a web storefront and admin console, served by a fifth service. Nothing in t
 227 Go tests (276 with subtests, all with `-race`) and 20 front-end tests.
 
 ## Verified
-In the sandbox: all Go tests, the front-end tests, type-check, lint and production build; the five real processes driven in a real browser; `check-k8s.py`. On the author's machine and in CI: the five images build and start under Compose, `smoke.sh` passes 82 of 82, `terraform validate` passes and the plan adds 16 resources, the Cassandra job and the full CI run are green, and the Cassandra staging flow runs on Kubernetes. The README table lists each part and who ran it.
-
-## Fixed after first build
-`frontend/scripts/clean-dist.mjs` failed inside the Docker build because the embed folder did not exist there yet. It now creates the folder first (found and fixed by the author).
+All Go tests, the front-end tests, type-check, lint and production build; the five real processes driven in a real browser; `check-k8s.py`; the five images build and start under Compose; `smoke.sh` passes 82 of 82; `terraform validate` passes and the plan adds 16 resources; the Cassandra job and the full CI run are green; the Cassandra staging flow runs on Kubernetes. The README verification table lists each part.

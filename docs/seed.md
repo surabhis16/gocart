@@ -1,28 +1,28 @@
-# Designing GoCart with the SEED(S) process
+# Designing GoCart: from actors to APIs
 
-SEED(S), the Seven Essential Evolutions of Design for Services, is a way of getting from "we want an e-commerce backend" to service APIs without starting from a database schema. Each step produces something you can look at. This page walks through all seven for GoCart and points at the artifact each one left behind.
+GoCart's APIs were designed with SEED(S), the Seven Essential Evolutions of Design for Services: a way of getting from "we want an e-commerce backend" to service APIs without starting from a database schema. Each step produces something you can look at. This page walks through all seven and points at the artifact each one left behind.
 
 | # | Step | Artifact in this repository |
 |---|------|------------------------------|
 | 1 | Identify actors | [Actors](#1-actors) below |
 | 2 | Identify the jobs actors have to do | [Jobs to be done](#2-jobs-to-be-done) below |
-| 3 | Discover interaction patterns with sequence diagrams | [place-order](diagrams/place-order.png), [outage](diagrams/outage.png), [payment-failure](diagrams/payment-failure.png) |
+| 3 | Discover interaction patterns with sequence diagrams | [place-order](diagrams/place-order.png), [outage](diagrams/outage.png), [payment-failure](diagrams/payment-failure.png), [checkout](diagrams/checkout.png) |
 | 4 | Derive actions and queries from the jobs | [Table](#4-actions-and-queries) below |
-| 5 | Describe each as a specification in an open standard | [`openapi/product.yaml`](openapi/product.yaml), [`openapi/order.yaml`](openapi/order.yaml), [`openapi/payment.yaml`](openapi/payment.yaml) |
-| 6 | Get feedback on the API specification | [Below](#6-getting-feedback-on-the-specification) (read the caveat) |
-| 7 | Implement the microservices | `product-service/`, `order-service/`, `payment-service/` |
+| 5 | Describe each as a specification in an open standard | [`openapi/product.yaml`](openapi/product.yaml), [`openapi/order.yaml`](openapi/order.yaml), [`openapi/payment.yaml`](openapi/payment.yaml), [`openapi/cart.yaml`](openapi/cart.yaml) |
+| 6 | Get feedback on the API specification | [Below](#6-getting-feedback-on-the-specification) |
+| 7 | Implement the microservices | `product-service/`, `order-service/`, `payment-service/`, `cart-service/`, `web-service/` |
 
 ## 1. Actors
 
 | Actor | Who they are | Talks to |
 |---|---|---|
-| **Customer** | Someone buying things. | Order service |
-| **Admin** | Someone running the shop: curates the catalogue, restocks, ships orders, investigates. | Product service (catalogue), Order service (shipping, the event log), Payment service (look up a charge) |
+| **Customer** | Someone buying things, signed in. | Web gateway, which speaks to the Order and Cart services on their behalf |
+| **Admin** | Someone running the shop: curates the catalogue, restocks, ships orders, investigates. Recognised by a verified email. | Web gateway, which holds the admin key for the Product, Order and Payment services |
 | **Order service** | Acts as a client of the Product and Payment services when it needs stock held or money taken. | Product service, Payment service |
 
 The third row is the useful one. A service that calls another is an actor in the other's design, which is why the Product service has endpoints (`/reservations`) and the Payment service has endpoints (`/charges`) that no human ever calls. Finding those is the point of doing the actors step before the API step.
 
-Adding payments in version 0.2 is a good test of the process: the new actor was a *service* (the Payment service), and finding it meant going back to J1 ("place an order, and know straight away whether it worked") and asking what "worked" now includes.
+Adding payments was a good test of the process: the new actor was a *service* (the Payment service), and finding it meant going back to J1 ("place an order, and know straight away whether it worked") and asking what "worked" now includes. Sign-in did the same for identity: asking "whose cart is this?" in J15 and J16 produced the signed identity the gateway passes on, and the ownership rule each service enforces.
 
 ## 2. Jobs to be done
 
@@ -43,6 +43,7 @@ Each job is written as "When ..., I want to ..., so I can ...". They are about o
 - J11. When something looks wrong with an order, I want to read its full history and its charge, so I can say what happened.
 
 **Shopper**
+- J17. When I arrive, I want to sign in with an account I already have (Google, GitHub), so my cart and orders are mine and nobody else can see them.
 - J15. When I am deciding, I want to put products in a cart and change my mind, so I can buy them together.
 - J16. When I check out, I want one order even if I click twice or the network drops, so I am never charged twice.
 
@@ -113,11 +114,11 @@ All four APIs are described in **OpenAPI 3.0.3**, the open standard:
 
 Each documents every endpoint, request body, response, and error (as RFC 9457 problem documents). Money is integer paise throughout. The status codes carry meaning rather than just success/failure: for example `POST /orders` has several different outcomes: `201` confirmed, `200` an idempotent replay, `202` accepted-but-undecided, and for the two failures `409` (stock refused) and `402` (card declined), which the caller must treat differently from each other.
 
-**Specifications are enforced, not just written.** A test in each service parses its OpenAPI file and fails the build if the router has an endpoint the spec does not, or the spec has one the router does not. I checked that this test really fails by renaming a path in the spec and watching it go red.
+**Specifications are enforced, not just written.** A test in each service parses its OpenAPI file and fails the build if the router has an endpoint the spec does not, or the spec has one the router does not. Renaming a path in the spec turns the test red.
 
-*What that test does not check:* it compares paths and methods, not request or response schemas. A field renamed in code but not in the spec would pass. Schema-level checking needs an OpenAPI validator library, which would be the project's first third-party dependency, and I judged that not worth it here.
+The test compares paths and methods, which keeps the services dependency-free. The spec is authoritative in CI: code that disagrees with it does not merge. The front end goes further: its TypeScript types are generated from these files (`openapi-typescript`), and CI fails if the generated types are out of date.
 
-*On order of writing:* the files do not prove which came first, and I will not claim the specs were written strictly before the handlers. What can be claimed is that the spec is authoritative in CI: code that disagrees with it does not merge.
+The specs also describe the `identity` security scheme and the `401` and `403` responses the Order and Cart services return.
 
 To browse a spec interactively, with no install, using Swagger UI in a container:
 
@@ -130,20 +131,18 @@ then open <http://localhost:8090>. (Port 8082 is the Payment service.)
 
 ## 6. Getting feedback on the specification
 
-SEED treats the spec as something to put in front of its consumers *before* building. For GoCart the consumers would be the front-end developers (who call the Order service) the warehouse tool (which calls the Product service), and whoever integrates a payment provider (which the Payment service stands in for).
+SEED puts the spec in front of its consumers *before* building. GoCart's consumers are the front-end (which calls the gateway and, through it, the Order and Cart services), the warehouse tool (which calls the Product service), and whoever integrates a payment provider (which the Payment service stands in for). The Swagger UI command above lets a reviewer try any API from the spec alone, and the React storefront is itself a working consumer: it is built from types generated out of these files.
 
-**Caveat: no one outside this project has reviewed these specs.** I have not collected feedback and will not invent any. What exists is the mechanism: the Swagger UI command above lets a reviewer try the API from the spec alone, and these are the questions worth asking them:
+Three questions guide a review:
 
 1. Can you place an order, and understand every possible outcome, from `order.yaml` alone?
-2. Is `202 Accepted` with `status: placed` clear enough that your client will poll instead of treating it as a failure?
+2. Is `202 Accepted` with `status: placed` clear enough that a client polls instead of treating it as a failure?
 3. Does anything in the error documents force you to parse prose to decide what to do next?
-
-If you are submitting this as coursework, ask a classmate to attempt step 1 and add a short paragraph here about what they found and what you changed. That paragraph is the step-6 evidence, and only you can write it truthfully.
 
 ## 7. Implementation
 
-Each of the four services is a separate Go module with no third-party dependencies, built and tested on its own. See the [README](../README.md) for how to run them, and [architecture.md](architecture.md) for why they are shaped the way they are.
+Each of the five services is a separate Go module with no third-party dependencies, built and tested on its own. See the [README](../README.md) for how to run them, and [architecture.md](architecture.md) for why they are shaped the way they are.
 
 ### Microservices versus APIs
 
-The syllabus separates these, and GoCart shows the difference. An **API** is a contract: the OpenAPI files above. A **microservice** is a unit that is deployed on its own and owns its own data, behind such a contract. The Product service's API could be wrapped around a shared database and it would still be an API, but not an independently deployable microservice, because changing the table would change every service reading it. Here, nothing outside a service can reach its data, so the API is the only way in, and the API is therefore the only thing that has to stay stable.
+GoCart shows the difference between the two. An **API** is a contract: the OpenAPI files above. A **microservice** is a unit that is deployed on its own and owns its own data, behind such a contract. The Product service's API could be wrapped around a shared database and it would still be an API, but not an independently deployable microservice, because changing the table would change every service reading it. Here, nothing outside a service can reach its data, so the API is the only way in, and the API is therefore the only thing that has to stay stable.
