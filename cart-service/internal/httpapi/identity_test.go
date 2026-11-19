@@ -17,7 +17,7 @@ var idSecret = []byte("0123456789abcdef0123456789abcdef")
 func identityFixture(t *testing.T, require bool) *fixture {
 	t.Helper()
 	f := newFixture(t)
-	f.srv = New(f.store, f.catalog, f.orders, slog.New(slog.NewTextHandler(io.Discard, nil)), WithIdentity(idSecret, require))
+	f.srv = New(f.store, f.catalog, f.orders, slog.New(slog.NewTextHandler(io.Discard, nil)), WithWishlist(f.wishlist), WithIdentity(idSecret, require))
 	f.h = f.srv.Handler()
 	return f
 }

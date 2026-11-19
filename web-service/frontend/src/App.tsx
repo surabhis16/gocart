@@ -4,6 +4,7 @@ import { Landing } from "./pages/Landing";
 import { Shop } from "./pages/Shop";
 import { RequireSignIn } from "./components/RequireSignIn";
 import { CartPage } from "./pages/Cart";
+import { WishlistPage } from "./pages/Wishlist";
 import { OrdersPage } from "./pages/Orders";
 import { OrderDetailPage } from "./pages/OrderDetail";
 import { NotFound } from "./pages/NotFound";
@@ -20,6 +21,7 @@ export function App() {
         <Route index element={<Landing />} />
         <Route path="shop" element={<Shop />} />
         <Route path="cart" element={<RequireSignIn><CartPage /></RequireSignIn>} />
+        <Route path="wishlist" element={<RequireSignIn><WishlistPage /></RequireSignIn>} />
         <Route path="orders" element={<RequireSignIn><OrdersPage /></RequireSignIn>} />
         <Route path="orders/:id" element={<RequireSignIn><OrderDetailPage /></RequireSignIn>} />
         <Route path="admin" element={<AdminLayout />}>

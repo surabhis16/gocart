@@ -216,6 +216,35 @@ req GET "$CART/carts/cust_cart_$RUN" ""
 check "the cart says which order it became" "$cart_order" "$(jq_ "d['order_id']")"
 
 echo
+WHO=cust_wish_$RUN
+echo "Wishlist: save for later, update quantities, remove, and clear"
+req GET "$CART/wishlists/cust_wish_$RUN" ""
+check "a new customer has an empty wishlist" 0 "$(jq_ "len(d['items'])")"
+req PUT "$CART/wishlists/cust_wish_$RUN/items/prd_nope" '{"quantity":1}'
+check "an unknown product cannot be added to wishlist (422)" 422 "$status"
+req PUT "$CART/wishlists/cust_wish_$RUN/items/$widget" '{"quantity":2}'
+check "adding a product to wishlist is 200" 200 "$status"
+check "wishlist item has quantity 2" 2 "$(jq_ "d['items'][0]['quantity']")"
+check "the wishlist holds no price" False "$(python3 -c 'import sys; print("price" in sys.argv[1])' "$body")"
+check "the wishlist holds no product name" False "$(python3 -c 'import sys; print("name" in sys.argv[1])' "$body")"
+check "wishlist item has added_at timestamp" True "$(python3 -c 'import sys; print("added_at" in sys.argv[1])' "$body")"
+req PUT "$CART/wishlists/cust_wish_$RUN/items/$widget" '{"quantity":5}'
+check "setting an updated quantity on wishlist is 200" 200 "$status"
+check "quantity updated to 5" 5 "$(jq_ "d['items'][0]['quantity']")"
+req PUT "$CART/wishlists/cust_wish_$RUN/items/$widget" '{"quantity":101}'
+check "wishlist rejects quantity exceeding 100 (422)" 422 "$status"
+req PUT "$CART/wishlists/cust_wish_$RUN/items/prd_lamp" '{"quantity":1}'
+check "adding a second product to wishlist is 200" 200 "$status"
+check "wishlist holds 2 items" 2 "$(jq_ "len(d['items'])")"
+req DELETE "$CART/wishlists/cust_wish_$RUN/items/prd_lamp" ""
+check "removing an item from wishlist is 200" 200 "$status"
+check "wishlist has 1 item after deletion" 1 "$(jq_ "len(d['items'])")"
+req DELETE "$CART/wishlists/cust_wish_$RUN" ""
+check "clearing the wishlist is 204" 204 "$status"
+req GET "$CART/wishlists/cust_wish_$RUN" ""
+check "wishlist is empty after clear" 0 "$(jq_ "len(d['items'])")"
+
+echo
 echo "Shipping and delivering: in order, once, and then it is final"
 req POST "$ORDER/orders/$cart_order/deliver" '' "${ADMIN[@]}"
 check "delivering an order that has not shipped is 409" 409 "$status"
@@ -226,7 +255,7 @@ check "delivering is 200" 200 "$status"
 check "status is delivered" delivered "$(jq_ "d['status']")"
 req POST "$ORDER/orders/$cart_order/deliver" '' "${ADMIN[@]}"
 check "delivering twice is 409" 409 "$status"
-req POST "$ORDER/orders/$cart_order/cancel" ''
+WHO=cust_cart_$RUN req POST "$ORDER/orders/$cart_order/cancel" ''
 check "a delivered order cannot be cancelled (409)" 409 "$status"
 
 echo
@@ -235,6 +264,7 @@ req GET "$WEB/" "" -D /tmp/smoke-web-headers.$$
 check "the app is served at /" 200 "$status"
 check "it is the single-page app" 1 "$(grep -c '<div id="root">' <<<"$body")"
 check "a deep link falls back to the app" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$WEB/orders/ord_anything")"
+check "the wishlist deep link falls back to the app" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$WEB/wishlist")"
 check "responses carry a content security policy" 1 "$(grep -ic '^content-security-policy:' /tmp/smoke-web-headers.$$)"
 rm -f /tmp/smoke-web-headers.$$
 req GET "$WEB/api/products" ""
@@ -247,6 +277,8 @@ req GET "$WEB/api/status" ""
 check "the status page needs an administrator (401 when signed out)" 401 "$status"
 req GET "$WEB/api/carts/cust_cart_$RUN" ""
 check "a cart needs a sign-in (401)" 401 "$status"
+req GET "$WEB/api/wishlists/cust_wish_$RUN" ""
+check "a wishlist needs a sign-in (401)" 401 "$status"
 req GET "$WEB/api/me" ""
 check "/api/me says nobody is signed in" False "$(jq_ "d['signed_in']")"
 req POST "$WEB/api/orders" '{"customer_id":"cust_x"}' -H "X-Requested-With: gocart"
@@ -263,6 +295,14 @@ if [ -n "$IDENTITY_SECRET" ] && [ -n "$SESSION_SECRET" ]; then
   check "and it is the same cart the Cart service holds" "$cart_order" "$(jq_ "d['order_id']")"
   req GET "$WEB/api/carts/cust_cart_$RUN" "" -H "Cookie: $(cookie cust_stranger)"
   check "someone else is refused (403)" 403 "$status"
+  req GET "$WEB/api/wishlists/cust_wish_$RUN" "" -H "Cookie: $(cookie "cust_wish_$RUN")"
+  check "the owner reads their wishlist through the gateway" 200 "$status"
+  req GET "$WEB/api/wishlists/cust_wish_$RUN" "" -H "Cookie: $(cookie cust_stranger)"
+  check "someone else cannot read the wishlist (403)" 403 "$status"
+  req PUT "$WEB/api/wishlists/cust_wish_$RUN/items/$widget" '{"quantity":1}' -H "Cookie: $(cookie "cust_wish_$RUN")"
+  check "modifying a wishlist without CSRF header is refused (403)" 403 "$status"
+  req PUT "$WEB/api/wishlists/cust_wish_$RUN/items/$widget" '{"quantity":1}' -H "Cookie: $(cookie "cust_wish_$RUN")" -H "X-Requested-With: gocart"
+  check "owner modifies wishlist through gateway with CSRF header (200)" 200 "$status"
   req GET "$WEB/api/orders/$cart_order" "" -H "Cookie: $(cookie cust_stranger)"
   check "someone else cannot see the order (404, as if it did not exist)" 404 "$status"
   req GET "$WEB/api/orders/$cart_order" "" -H "Cookie: $(cookie "cust_cart_$RUN")"

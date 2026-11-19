@@ -13,6 +13,9 @@ export type OrderStatus = Order_["schemas"]["Status"];
 export type PlaceOrderRequest = Order_["schemas"]["PlaceOrderRequest"];
 export type Cart = Cart_["schemas"]["Cart"];
 export type CartLine = Cart_["schemas"]["Line"];
+export type Wishlist = Cart_["schemas"]["Wishlist"];
+export type WishlistItem = Cart_["schemas"]["WishlistItem"];
+export type SetWishlistItem = Cart_["schemas"]["SetWishlistItem"];
 export type Problem = Order_["schemas"]["Problem"] & Record<string, unknown>;
 export type Charge = Payment_["schemas"]["Charge"];
 

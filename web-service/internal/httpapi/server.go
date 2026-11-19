@@ -109,6 +109,11 @@ func New(up Upstreams, ui fs.FS, log *slog.Logger, opts ...Option) (*Server, err
 		{"DELETE /api/carts/{customer_id}/items/{product_id}", g(user, cart)},
 		{"POST /api/carts/{customer_id}/checkout", g(user, cart)},
 
+		{"GET /api/wishlists/{customer_id}", g(user, cart)},
+		{"DELETE /api/wishlists/{customer_id}", g(user, cart)},
+		{"PUT /api/wishlists/{customer_id}/items/{product_id}", g(user, cart)},
+		{"DELETE /api/wishlists/{customer_id}/items/{product_id}", g(user, cart)},
+
 		{"GET /api/charges/{order_id}", g(admin, payment)},
 
 		{"/api/", s.noSuchAPI},

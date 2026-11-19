@@ -126,6 +126,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/wishlists/{customer_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                customer_id: components["parameters"]["CustomerId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a customer's wishlist
+         * @description A customer with no wishlist has an empty one.
+         */
+        get: operations["getWishlist"];
+        put?: never;
+        post?: never;
+        /**
+         * Empty the wishlist
+         * @description Idempotent. Clearing an empty wishlist succeeds and changes nothing.
+         */
+        delete: operations["clearWishlist"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/wishlists/{customer_id}/items/{product_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                customer_id: components["parameters"]["CustomerId"];
+                product_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Add or update an item in the wishlist
+         * @description States the quantity saved. A product being added for the first time is
+         *     checked against the Product service; one already in the wishlist is
+         *     not, so quantities can still change while the Product service is down.
+         */
+        put: operations["setWishlistItem"];
+        post?: never;
+        /**
+         * Take a product out of the wishlist
+         * @description Idempotent. Removing a product that is not there succeeds.
+         */
+        delete: operations["removeWishlistItem"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -159,6 +214,31 @@ export interface components {
         };
         SetItem: {
             /** @example 2 */
+            quantity: number;
+        };
+        Wishlist: {
+            customer_id: string;
+            /** @description Sorted by product id. Empty array when no items are saved. */
+            items: components["schemas"]["WishlistItem"][];
+            /** Format: date-time */
+            updated_at?: string;
+        };
+        WishlistItem: {
+            /** @example prd_lamp */
+            product_id: string;
+            quantity: number;
+            /** Format: date-time */
+            added_at: string;
+        };
+        /**
+         * @description Quantity to set. Optional; defaults to 1 if omitted or if an empty
+         *     body is sent.
+         */
+        SetWishlistItem: {
+            /**
+             * @default 1
+             * @example 1
+             */
             quantity: number;
         };
         CheckoutRequest: {
@@ -516,6 +596,133 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+        };
+    };
+    getWishlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                customer_id: components["parameters"]["CustomerId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The wishlist. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Wishlist"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    clearWishlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                customer_id: components["parameters"]["CustomerId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The wishlist is empty. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    setWishlistItem: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                customer_id: components["parameters"]["CustomerId"];
+                product_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SetWishlistItem"];
+            };
+        };
+        responses: {
+            /** @description The wishlist after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Wishlist"];
+                };
+            };
+            400: components["responses"]["MalformedBody"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
+            413: components["responses"]["TooLarge"];
+            /**
+             * @description `validation-failed` (quantity out of range, more than 100 products)
+             *     or `unknown-product`.
+             */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `product-service-unavailable`. Nothing changed; safe to retry. */
+            503: {
+                headers: {
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    removeWishlistItem: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                customer_id: components["parameters"]["CustomerId"];
+                product_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The wishlist after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Wishlist"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["ValidationFailed"];
         };
     };
 }

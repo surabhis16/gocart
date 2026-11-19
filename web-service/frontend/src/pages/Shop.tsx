@@ -1,5 +1,13 @@
 import { useMemo, useState } from "react";
-import { useCart, useProducts, useRemoveItem, useSetItem } from "../api/hooks";
+import {
+  useCart,
+  useProducts,
+  useRemoveItem,
+  useSetItem,
+  useWishlist,
+  useSetWishlistItem,
+  useRemoveWishlistItem,
+} from "../api/hooks";
 import { ErrorNote, Loading, PageTitle, EmptyState, Notice } from "../components/ui";
 import { ProductCard } from "../components/ProductCard";
 import { activeLines } from "../lib/cart";
@@ -12,7 +20,32 @@ export function Shop() {
   const cart = useCart(customer);
   const setItem = useSetItem(customer);
   const removeItem = useRemoveItem(customer);
+  const wishlist = useWishlist(customer);
+  const setWishlistItem = useSetWishlistItem(customer);
+  const removeWishlistItem = useRemoveWishlistItem(customer);
   const [query, setQuery] = useState("");
+  const savedIds = useMemo(
+    () => new Set((wishlist.data?.items ?? []).map((item) => item.product_id)),
+    [wishlist.data],
+  );
+
+  // Wishlist add/remove handler
+  const toggleWishlist = (productId: string) => {
+    if (!me.data?.signed_in) {
+      window.location.assign(signInUrl("/shop"));
+      return;
+    }
+
+    if (setWishlistItem.isPending || removeWishlistItem.isPending) {
+      return;
+    }
+
+    if (savedIds.has(productId)) {
+      removeWishlistItem.mutate(productId);
+    } else {
+      setWishlistItem.mutate({ productId, quantity: 1 });
+    }
+  };
 
   const lines = activeLines(cart.data);
   const inCart = useMemo(() => new Map(lines.map((l) => [l.product_id, l.quantity])), [lines]);
@@ -29,7 +62,12 @@ export function Shop() {
   const signedOut = me.isSuccess && !me.data.signed_in;
   const change = (productId: string, quantity: number) =>
     signedOut ? window.location.assign(signInUrl("/shop")) : quantity <= 0 ? removeItem.mutate(productId) : setItem.mutate({ productId, quantity });
-  const failure = setItem.error ?? removeItem.error;
+  const failure =
+    setItem.error ??
+    removeItem.error ??
+    setWishlistItem.error ??
+    removeWishlistItem.error ??
+    wishlist.error;
 
   return (
     <>
@@ -64,8 +102,19 @@ export function Shop() {
               key={p.id}
               product={p}
               inCart={inCart.get(p.id) ?? 0}
-              busy={(setItem.isPending && setItem.variables?.productId === p.id) || (removeItem.isPending && removeItem.variables === p.id)}
+              busy={
+                (setItem.isPending && setItem.variables?.productId === p.id) ||
+                (removeItem.isPending && removeItem.variables === p.id)
+              }
               onSet={(q) => change(p.id, q)}
+              saved={savedIds.has(p.id)}
+              wishlistBusy={
+                (setWishlistItem.isPending &&
+                  setWishlistItem.variables?.productId === p.id) ||
+                (removeWishlistItem.isPending &&
+                  removeWishlistItem.variables === p.id)
+              }
+              onToggleWishlist={() => toggleWishlist(p.id)}
             />
           ))}
         </div>

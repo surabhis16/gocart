@@ -18,6 +18,7 @@ import (
 	"gocart/cart-service/internal/orderclient"
 	"gocart/cart-service/internal/productclient"
 	"gocart/cart-service/internal/reqid"
+	"gocart/cart-service/internal/wishlist"
 )
 
 const maxBodyBytes = 1 << 20
@@ -39,15 +40,21 @@ type route struct {
 
 // Server wires the cart store to HTTP.
 type Server struct {
-	carts   *cart.Store
-	catalog Catalog
-	orders  Orders
-	log     *slog.Logger
-	routes  []route
-	metrics *metrics
+	carts    *cart.Store
+	wishlist *wishlist.Store
+	catalog  Catalog
+	orders   Orders
+	log      *slog.Logger
+	routes   []route
+	metrics  *metrics
 
 	identitySecret  []byte
 	requireIdentity bool
+}
+
+// WithWishlist sets the wishlist store for the server.
+func WithWishlist(w *wishlist.Store) Option {
+	return func(s *Server) { s.wishlist = w }
 }
 
 // New builds a Server.
@@ -64,8 +71,26 @@ func New(carts *cart.Store, catalog Catalog, orders Orders, log *slog.Logger, op
 		{"PUT /carts/{customer_id}/items/{product_id}", s.setItem},
 		{"DELETE /carts/{customer_id}/items/{product_id}", s.removeItem},
 		{"POST /carts/{customer_id}/checkout", s.checkout},
+		{"GET /wishlists/{customer_id}", s.getWishlist},
+		{"DELETE /wishlists/{customer_id}", s.clearWishlist},
+		{"PUT /wishlists/{customer_id}/items/{product_id}", s.setWishlistItem},
+		{"DELETE /wishlists/{customer_id}/items/{product_id}", s.removeWishlistItem},
 	}
 	return s
+}
+
+func (s *Server) wishlistStore(w http.ResponseWriter, r *http.Request) bool {
+	if s.wishlist == nil {
+		s.log.Error("wishlist store is not configured", "request_id", reqid.From(r.Context()))
+		writeProblem(w, r, Problem{
+			Type:   "internal",
+			Title:  "Wishlist not configured",
+			Status: http.StatusInternalServerError,
+			Detail: "The wishlist store is not configured.",
+		})
+		return false
+	}
+	return true
 }
 
 func (s *Server) gauges() []Gauge {
@@ -217,6 +242,100 @@ func (s *Server) removeItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
+func (s *Server) getWishlist(w http.ResponseWriter, r *http.Request) {
+	if !s.wishlistStore(w, r) {
+		return
+	}
+	id, ok := s.customer(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, s.wishlist.Get(id))
+}
+
+func (s *Server) clearWishlist(w http.ResponseWriter, r *http.Request) {
+	if !s.wishlistStore(w, r) {
+		return
+	}
+	id, ok := s.customer(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.wishlist.Clear(id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) setWishlistItem(w http.ResponseWriter, r *http.Request) {
+	if !s.wishlistStore(w, r) {
+		return
+	}
+	id, ok := s.customer(w, r)
+	if !ok {
+		return
+	}
+	product := r.PathValue("product_id")
+	if !wishlist.ValidProductID(product) {
+		writeProblem(w, r, Problem{
+			Type:   "validation-failed",
+			Title:  "Validation failed",
+			Status: http.StatusUnprocessableEntity,
+			Detail: "product id must be 1-64 characters from A-Z a-z 0-9 . _ -",
+		})
+		return
+	}
+	var in struct {
+		Quantity *int `json:"quantity"`
+	}
+	if !decodeOptional(w, r, &in) {
+		return
+	}
+	qty := 1
+	if in.Quantity != nil {
+		qty = *in.Quantity
+	}
+	if !s.wishlist.Has(id, product) {
+		if _, err := s.catalog.Name(r.Context(), product); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	}
+	wl, err := s.wishlist.SetItem(id, wishlist.Item{ProductID: product, Quantity: qty})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wl)
+}
+
+func (s *Server) removeWishlistItem(w http.ResponseWriter, r *http.Request) {
+	if !s.wishlistStore(w, r) {
+		return
+	}
+	id, ok := s.customer(w, r)
+	if !ok {
+		return
+	}
+	product := r.PathValue("product_id")
+	if !wishlist.ValidProductID(product) {
+		writeProblem(w, r, Problem{
+			Type:   "validation-failed",
+			Title:  "Validation failed",
+			Status: http.StatusUnprocessableEntity,
+			Detail: "product id must be 1-64 characters from A-Z a-z 0-9 . _ -",
+		})
+		return
+	}
+	wl, err := s.wishlist.RemoveItem(id, product)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wl)
+}
+
 // checkout turns the cart into an order. The answer is the Order service's
 // own, passed through, so every status it can give (201 created, 200 replayed,
 // 202 still settling, 402 declined, 409 rejected) reaches the caller intact.
@@ -326,10 +445,41 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return false
 }
 
+// decodeOptional reads a strict JSON body, but treats an empty body or EOF as
+// valid, allowing default fields to remain in dst.
+func decodeOptional(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if r.Body == nil {
+		return true
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	err := dec.Decode(dst)
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	if err == nil {
+		if _, extra := dec.Token(); !errors.Is(extra, io.EOF) {
+			err = errors.New("request body must contain a single JSON object")
+		}
+	}
+	if err == nil {
+		return true
+	}
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		writeProblem(w, r, Problem{Type: "payload-too-large", Title: "Request body too large", Status: http.StatusRequestEntityTooLarge,
+			Detail: "The body may be at most " + strconv.Itoa(maxBodyBytes) + " bytes."})
+		return false
+	}
+	writeProblem(w, r, Problem{Type: "invalid-request", Title: "Malformed request body", Status: http.StatusBadRequest, Detail: err.Error()})
+	return false
+}
+
 // fail maps errors onto problem responses.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, cart.ErrInvalid):
+	case errors.Is(err, cart.ErrInvalid), errors.Is(err, wishlist.ErrInvalid):
 		writeProblem(w, r, Problem{Type: "validation-failed", Title: "Validation failed", Status: http.StatusUnprocessableEntity, Detail: err.Error()})
 	case errors.Is(err, productclient.ErrUnknown):
 		writeProblem(w, r, Problem{

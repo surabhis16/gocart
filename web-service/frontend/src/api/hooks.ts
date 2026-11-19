@@ -1,6 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, request, requestRaw } from "./client";
-import type { Cart, Charge, NewProduct, Order, OrderEvent, OrderStatus, Product, ServiceStatus } from "./types";
+import type {
+  Cart,
+  Charge,
+  NewProduct,
+  Order,
+  OrderEvent,
+  OrderStatus,
+  Product,
+  ServiceStatus,
+  Wishlist,
+} from "./types";
 import { interpretCheckout, interpretFailure, type CheckoutOutcome } from "../lib/checkout";
 import { isSettling } from "../lib/orderFlow";
 
@@ -9,6 +19,7 @@ const enc = encodeURIComponent;
 export const keys = {
   products: ["products"] as const,
   cart: (c: string) => ["cart", c] as const,
+  wishlist: (c: string) => ["wishlist", c] as const,
   orders: (c: string) => ["orders", "customer", c] as const,
   order: (id: string) => ["order", id] as const,
   adminOrders: (status: string) => ["orders", "admin", status] as const,
@@ -56,6 +67,49 @@ export function useClearCart(customer: string) {
   return useMutation({
     mutationFn: () => request<void>(`/carts/${enc(customer)}`, { method: "DELETE" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: keys.cart(customer) }),
+  });
+}
+
+// ---- wishlist --------------------------------------------------------------
+
+export function useWishlist(customer: string) {
+  return useQuery({
+    queryKey: keys.wishlist(customer),
+    queryFn: () => request<Wishlist>(`/wishlists/${enc(customer)}`),
+    enabled: customer !== "",
+  });
+}
+
+export function useSetWishlistItem(customer: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { productId: string; quantity: number }) =>
+      request<Wishlist>(
+        `/wishlists/${enc(customer)}/items/${enc(v.productId)}`,
+        { method: "PUT", body: { quantity: v.quantity } },
+      ),
+    onSuccess: (wishlist) => qc.setQueryData(keys.wishlist(customer), wishlist),
+  });
+}
+
+export function useRemoveWishlistItem(customer: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (productId: string) =>
+      request<Wishlist>(
+        `/wishlists/${enc(customer)}/items/${enc(productId)}`,
+        { method: "DELETE" },
+      ),
+    onSuccess: (wishlist) => qc.setQueryData(keys.wishlist(customer), wishlist),
+  });
+}
+
+export function useClearWishlist(customer: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      request<void>(`/wishlists/${enc(customer)}`, { method: "DELETE" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keys.wishlist(customer) }),
   });
 }
 

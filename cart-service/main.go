@@ -6,7 +6,7 @@
 //	PORT         listen port                         (default 8083)
 //	PRODUCT_URL  base URL of the Product service     (default http://localhost:8080)
 //	ORDER_URL    base URL of the Order service       (default http://localhost:8081)
-//	DATA_DIR     where carts.json is kept            (default ./data)
+//	DATA_DIR     where carts.json and wishlists.json are kept (default ./data)
 //	IDENTITY_SECRET  signs the gateway's identity assertion (32+ characters)
 //	REQUIRE_IDENTITY "true": every cart route refuses callers that are not signed in
 //	LOG_LEVEL    debug | info | warn | error         (default info)
@@ -30,6 +30,7 @@ import (
 	"gocart/cart-service/internal/identity"
 	"gocart/cart-service/internal/orderclient"
 	"gocart/cart-service/internal/productclient"
+	"gocart/cart-service/internal/wishlist"
 )
 
 // version is stamped at build time: -ldflags "-X main.version=1.2.3".
@@ -52,7 +53,12 @@ func main() {
 }
 
 func run(log *slog.Logger, port string) error {
-	store, err := cart.Open(env("DATA_DIR", "./data"))
+	dataDir := env("DATA_DIR", "./data")
+	store, err := cart.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	wishlistStore, err := wishlist.Open(dataDir)
 	if err != nil {
 		return err
 	}
@@ -71,7 +77,7 @@ func run(log *slog.Logger, port string) error {
 	}
 
 	api := httpapi.New(store, productclient.New(productURL, nil), orderclient.New(orderURL, nil), log,
-		httpapi.WithIdentity(secret, require), httpapi.WithVersion(version))
+		httpapi.WithWishlist(wishlistStore), httpapi.WithIdentity(secret, require), httpapi.WithVersion(version))
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           api.Handler(),

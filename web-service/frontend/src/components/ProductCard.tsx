@@ -16,14 +16,49 @@ interface Props {
   inCart: number;
   busy: boolean;
   onSet: (quantity: number) => void;
+  saved: boolean;
+  wishlistBusy: boolean;
+  onToggleWishlist: () => void;
 }
 
-export function ProductCard({ product: p, inCart, busy, onSet }: Props) {
+export function ProductCard({
+  product: p,
+  inCart,
+  busy,
+  onSet,
+  saved,
+  wishlistBusy,
+  onToggleWishlist,
+}: Props) {
   const max = maxFor(p);
   const soldOut = p.stock <= 0;
   return (
     <article className={`panel flex flex-col overflow-hidden transition hover:border-ink ${soldOut ? "opacity-70" : ""}`}>
-      <ProductArt id={p.id} className="aspect-[8/5] w-full border-b border-ink/20" />
+      <div className="flex justify-end px-3 pt-3">
+        <Button
+          variant="ghost"
+          className="!px-2"
+          disabled={wishlistBusy}
+          busy={wishlistBusy}
+          onClick={onToggleWishlist}
+          aria-label={
+            saved
+              ? `Remove ${p.name} from wishlist`
+              : `Add ${p.name} to wishlist`
+          }
+          aria-pressed={saved}
+        >
+          <Icon
+            name="heart"
+            className={`h-5 w-5 ${saved ? "fill-current text-brand" : ""}`}
+          />
+        </Button>
+      </div>
+
+      <ProductArt
+        id={p.id}
+        className="aspect-[8/5] w-full border-b border-ink/20"
+      />
       <div className="flex flex-1 flex-col p-4">
         <h2 className="text-lg font-semibold leading-snug">{p.name}</h2>
         <p className="mt-1 flex-1 text-sm leading-relaxed text-muted">{p.description}</p>

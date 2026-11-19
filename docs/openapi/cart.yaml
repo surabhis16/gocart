@@ -25,6 +25,11 @@ info:
     A checked-out cart keeps the lines that were bought. The next change to it
     (adding, removing, clearing) starts a fresh cart.
 
+    **Wishlists save items for later.** Like a cart, a wishlist holds no prices.
+    Wishlist data is persisted separately in `wishlists.json` in the same
+    `DATA_DIR` as `carts.json`. Access is private and strictly isolated to the
+    signed-in customer using the same identity assertion.
+
     **A cart belongs to the signed-in customer.** The customer id is in the path
     and must match the identity the gateway signed (`X-Gocart-Identity`, see the
     `identity` security scheme): another customer's cart is `403`, and with
@@ -39,6 +44,8 @@ servers:
 tags:
   - name: cart
     description: Build a cart.
+  - name: wishlist
+    description: Save items for later.
   - name: checkout
     description: Turn a cart into an order.
   - name: ops
@@ -268,6 +275,118 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /wishlists/{customer_id}:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+    get:
+      tags: [wishlist]
+      operationId: getWishlist
+      summary: Get a customer's wishlist
+      description: A customer with no wishlist has an empty one.
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "200":
+          description: The wishlist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wishlist"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      tags: [wishlist]
+      operationId: clearWishlist
+      summary: Empty the wishlist
+      description: Idempotent. Clearing an empty wishlist succeeds and changes nothing.
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "204":
+          description: The wishlist is empty.
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+  /wishlists/{customer_id}/items/{product_id}:
+    parameters:
+      - $ref: "#/components/parameters/CustomerId"
+      - name: product_id
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: "^[A-Za-z0-9._-]{1,64}$"
+          example: prd_lamp
+    put:
+      tags: [wishlist]
+      operationId: setWishlistItem
+      summary: Add or update an item in the wishlist
+      description: |
+        States the quantity saved. A product being added for the first time is
+        checked against the Product service; one already in the wishlist is
+        not, so quantities can still change while the Product service is down.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetWishlistItem"
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "200":
+          description: The wishlist after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wishlist"
+        "400":
+          $ref: "#/components/responses/MalformedBody"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "422":
+          description: |
+            `validation-failed` (quantity out of range, more than 100 products)
+            or `unknown-product`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            `product-service-unavailable`. Nothing changed; safe to retry.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 2
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      tags: [wishlist]
+      operationId: removeWishlistItem
+      summary: Take a product out of the wishlist
+      description: Idempotent. Removing a product that is not there succeeds.
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "200":
+          description: The wishlist after the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wishlist"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
 components:
   parameters:
     CustomerId:
@@ -373,6 +492,47 @@ components:
           minimum: 1
           maximum: 100
           example: 2
+    Wishlist:
+      type: object
+      required: [customer_id, items]
+      properties:
+        customer_id:
+          type: string
+        items:
+          type: array
+          description: Sorted by product id. Empty array when no items are saved.
+          items:
+            $ref: "#/components/schemas/WishlistItem"
+        updated_at:
+          type: string
+          format: date-time
+    WishlistItem:
+      type: object
+      required: [product_id, quantity, added_at]
+      properties:
+        product_id:
+          type: string
+          example: prd_lamp
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+        added_at:
+          type: string
+          format: date-time
+    SetWishlistItem:
+      type: object
+      additionalProperties: false
+      description: |
+        Quantity to set. Optional; defaults to 1 if omitted or if an empty
+        body is sent.
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 1
+          example: 1
     CheckoutRequest:
       type: object
       required: [payment_token]

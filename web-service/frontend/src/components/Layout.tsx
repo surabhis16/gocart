@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { signOut as endSession } from "../api/client";
-import { useCart } from "../api/hooks";
+import { useCart, useWishlist } from "../api/hooks";
 import { itemCount } from "../lib/cart";
 import { meKey, signInUrl, useMe, type SignedIn } from "../lib/identity";
 import { Icon } from "./ui";
@@ -47,8 +47,11 @@ function Account({ me }: { me: SignedIn }) {
 export function Layout() {
   const me = useMe();
   const person = me.data?.signed_in ? me.data : null;
-  const cart = useCart(person?.customer_id ?? "");
+  const customer = person?.customer_id ?? "";
+  const cart = useCart(customer);
+  const wishlist = useWishlist(customer);
   const count = person ? itemCount(cart.data) : 0;
+  const wishlistCount = person ? (wishlist.data?.items.length ?? 0) : 0;
   const here = useLocation();
 
   return (
@@ -77,6 +80,19 @@ export function Layout() {
                 </span>
               )}
             </NavLink>
+            {person && (
+              <NavLink to="/wishlist" className={link}>
+                Wishlist
+                {wishlistCount > 0 && (
+                  <span
+                    className="ml-1.5 rounded-sm bg-brand px-1.5 py-0.5 text-[11px] font-bold text-brand-ink"
+                    aria-label={`${wishlistCount} saved products`}
+                  >
+                    {wishlistCount}
+                  </span>
+                )}
+              </NavLink>
+            )}
           </nav>
           <div className="ml-auto flex items-center gap-2">
             {person?.role === "admin" && (

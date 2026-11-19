@@ -16,10 +16,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"gocart/cart-service/internal/cart"
+	"gocart/cart-service/internal/identity"
 	"gocart/cart-service/internal/orderclient"
 	"gocart/cart-service/internal/productclient"
+	"gocart/cart-service/internal/wishlist"
 )
 
 // fakeCatalog knows a fixed set of products and can be taken down.
@@ -86,25 +89,32 @@ func (f *fakeOrders) Place(_ context.Context, key, customer, token string, lines
 }
 
 type fixture struct {
-	srv     *Server
-	h       http.Handler
-	store   *cart.Store
-	catalog *fakeCatalog
-	orders  *fakeOrders
+	srv      *Server
+	h        http.Handler
+	store    *cart.Store
+	wishlist *wishlist.Store
+	catalog  *fakeCatalog
+	orders   *fakeOrders
 }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	store, err := cart.Open(t.TempDir())
+	dir := t.TempDir()
+	store, err := cart.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wishlistStore, err := wishlist.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f := &fixture{
-		store:   store,
-		catalog: &fakeCatalog{known: map[string]string{"prd_lamp": "Desk lamp", "prd_cable": "Cable"}},
-		orders:  &fakeOrders{byKey: map[string]orderclient.Response{}},
+		store:    store,
+		wishlist: wishlistStore,
+		catalog:  &fakeCatalog{known: map[string]string{"prd_lamp": "Desk lamp", "prd_cable": "Cable"}},
+		orders:   &fakeOrders{byKey: map[string]orderclient.Response{}},
 	}
-	f.srv = New(store, f.catalog, f.orders, slog.New(slog.NewTextHandler(io.Discard, nil)), WithVersion("test"))
+	f.srv = New(store, f.catalog, f.orders, slog.New(slog.NewTextHandler(io.Discard, nil)), WithWishlist(wishlistStore), WithVersion("test"))
 	f.h = f.srv.Handler()
 	return f
 }
@@ -390,6 +400,250 @@ func TestHealthAndMetrics(t *testing.T) {
 	}
 	if strings.Contains(text, "admin") {
 		t.Error("the cart has no admin endpoints, so it must not export admin metrics")
+	}
+}
+
+func TestWishlistEndpoints(t *testing.T) {
+	f := newFixture(t)
+
+	// 1. Empty wishlist retrieval
+	rec := f.do(t, "GET", "/wishlists/cust_ada", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get empty wishlist: %d %s", rec.Code, rec.Body)
+	}
+	m := asMap(t, rec)
+	if m["customer_id"] != "cust_ada" {
+		t.Errorf("customer_id = %v", m["customer_id"])
+	}
+	items, ok := m["items"].([]any)
+	if !ok || len(items) != 0 {
+		t.Errorf("expected empty items array, got %v", m["items"])
+	}
+
+	// 2. Add item with explicit quantity
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"quantity":3}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add wishlist item: %d %s", rec.Code, rec.Body)
+	}
+	m = asMap(t, rec)
+	items = m["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	it := items[0].(map[string]any)
+	if it["product_id"] != "prd_lamp" || int(it["quantity"].(float64)) != 3 {
+		t.Errorf("unexpected item fields: %+v", it)
+	}
+	if _, hasName := it["name"]; hasName {
+		t.Errorf("wishlist item MUST NOT contain name field: %+v", it)
+	}
+
+	// 3. Update quantity with empty body defaults to 1 (absolute SET)
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default quantity set: %d %s", rec.Code, rec.Body)
+	}
+	m = asMap(t, rec)
+	it = m["items"].([]any)[0].(map[string]any)
+	if int(it["quantity"].(float64)) != 1 {
+		t.Errorf("expected default quantity 1, got %v", it["quantity"])
+	}
+
+	// 3b. JSON "null" body also defaults quantity to 1
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", "null")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("null body quantity set: %d %s", rec.Code, rec.Body)
+	}
+	m = asMap(t, rec)
+	it = m["items"].([]any)[0].(map[string]any)
+	if int(it["quantity"].(float64)) != 1 {
+		t.Errorf("expected null body to give quantity 1, got %v", it["quantity"])
+	}
+
+	// 4. Unknown product returns 422
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/prd_unknown", `{"quantity":1}`)
+	wantProblem(t, rec, http.StatusUnprocessableEntity, "unknown-product")
+
+	// 4b. Invalid product ID format is rejected BEFORE calling Product Service
+	callsBefore := f.catalog.calls
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/invalid%20id", `{"quantity":1}`)
+	wantProblem(t, rec, http.StatusUnprocessableEntity, "validation-failed")
+	if f.catalog.calls != callsBefore {
+		t.Errorf("catalog should not be queried when product id is malformed; calls = %d, want %d", f.catalog.calls, callsBefore)
+	}
+
+	// 5. Product service down: existing item still updates, new item returns 503
+	f.catalog.down = true
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"quantity":4}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update existing item while catalog down: %d %s", rec.Code, rec.Body)
+	}
+	it = asMap(t, rec)["items"].([]any)[0].(map[string]any)
+	if int(it["quantity"].(float64)) != 4 {
+		t.Errorf("quantity not updated while catalog down: %+v", it)
+	}
+
+	rec = f.do(t, "PUT", "/wishlists/cust_ada/items/prd_cable", `{"quantity":1}`)
+	wantProblem(t, rec, http.StatusServiceUnavailable, "product-service-unavailable")
+	f.catalog.down = false
+
+	// 6. Validation failures
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"quantity":0}`), http.StatusUnprocessableEntity, "validation-failed")
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"quantity":101}`), http.StatusUnprocessableEntity, "validation-failed")
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"quantity":"not-number"}`), http.StatusBadRequest, "invalid-request")
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"unknown_field":true}`), http.StatusBadRequest, "invalid-request")
+	wantProblem(t, f.do(t, "PUT", "/wishlists/bad@customer/items/prd_lamp", `{"quantity":1}`), http.StatusUnprocessableEntity, "validation-failed")
+
+	// 7. Remove item
+	rec = f.do(t, "DELETE", "/wishlists/cust_ada/items/prd_lamp", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("remove item: %d %s", rec.Code, rec.Body)
+	}
+	if len(asMap(t, rec)["items"].([]any)) != 0 {
+		t.Errorf("expected 0 items after remove")
+	}
+
+	// 8. Clear wishlist
+	if _, err := f.wishlist.SetItem("cust_ada", wishlist.Item{ProductID: "prd_lamp", Quantity: 1}); err != nil {
+		t.Fatalf("set item before clear: %v", err)
+	}
+	rec = f.do(t, "DELETE", "/wishlists/cust_ada", "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("clear wishlist: %d", rec.Code)
+	}
+	if len(f.wishlist.Get("cust_ada").Items) != 0 {
+		t.Errorf("wishlist not empty after clear")
+	}
+
+	// 9. Malformed bodies, extra tokens, and payload too large
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", "not-json"), http.StatusBadRequest, "invalid-request")
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", `{"quantity": 1} 123`), http.StatusBadRequest, "invalid-request")
+	huge := `{"quantity": 1, "padding":"` + strings.Repeat("x", maxBodyBytes+10) + `"}`
+	wantProblem(t, f.do(t, "PUT", "/wishlists/cust_ada/items/prd_lamp", huge), http.StatusRequestEntityTooLarge, "payload-too-large")
+}
+
+func TestWishlistCustomerIsolationAndIdentity(t *testing.T) {
+	dir := t.TempDir()
+	store, err := cart.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wishlistStore, err := wishlist.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &fakeCatalog{known: map[string]string{"prd_lamp": "Desk lamp"}}
+	srv := New(store, catalog, &fakeOrders{}, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithWishlist(wishlistStore), WithIdentity(idSecret, true))
+	h := srv.Handler()
+
+	as := func(sub string, method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set(identity.Header, identity.Sign(idSecret, identity.Claims{
+			Sub: sub, Role: identity.RoleCustomer, Exp: time.Now().Add(time.Minute).Unix(),
+		}))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Customer 1 adds an item
+	if rec := as("cust_1", "PUT", "/wishlists/cust_1/items/prd_lamp", `{"quantity":2}`); rec.Code != http.StatusOK {
+		t.Fatalf("customer 1 add: %d %s", rec.Code, rec.Body)
+	}
+
+	// Customer 2 attempts to read, mutate, or delete customer 1's wishlist -> all 403 Forbidden
+	for _, c := range [][3]string{
+		{"GET", "/wishlists/cust_1", ""},
+		{"PUT", "/wishlists/cust_1/items/prd_lamp", `{"quantity":5}`},
+		{"DELETE", "/wishlists/cust_1/items/prd_lamp", ""},
+		{"DELETE", "/wishlists/cust_1", ""},
+	} {
+		wantProblem(t, as("cust_2", c[0], c[1], c[2]), http.StatusForbidden, "forbidden")
+	}
+
+	// Anonymous request with REQUIRE_IDENTITY -> 401
+	anonReq := httptest.NewRequest("GET", "/wishlists/cust_1", nil)
+	anonRec := httptest.NewRecorder()
+	h.ServeHTTP(anonRec, anonReq)
+	wantProblem(t, anonRec, http.StatusUnauthorized, "unauthenticated")
+
+	// Bad assertion -> 401
+	badReq := httptest.NewRequest("GET", "/wishlists/cust_1", nil)
+	badReq.Header.Set(identity.Header, "bad-token")
+	badRec := httptest.NewRecorder()
+	h.ServeHTTP(badRec, badReq)
+	wantProblem(t, badRec, http.StatusUnauthorized, "unauthenticated")
+
+	// Verify Customer 1's wishlist remained untouched by Customer 2's attempted attacks
+	wl := wishlistStore.Get("cust_1")
+	if len(wl.Items) != 1 || wl.Items[0].Quantity != 2 {
+		t.Fatalf("customer 1 wishlist was altered by a stranger: %+v", wl.Items)
+	}
+}
+
+func TestWishlistPersistenceAcrossServerReopen(t *testing.T) {
+	dir := t.TempDir()
+	store1, _ := cart.Open(dir)
+	wlStore1, _ := wishlist.Open(dir)
+	cat := &fakeCatalog{known: map[string]string{"prd_lamp": "Desk lamp"}}
+	srv1 := New(store1, cat, &fakeOrders{}, slog.New(slog.NewTextHandler(io.Discard, nil)), WithWishlist(wlStore1))
+
+	// Add item via server 1
+	req1 := httptest.NewRequest("PUT", "/wishlists/cust_persist/items/prd_lamp", strings.NewReader(`{"quantity":3}`))
+	rec1 := httptest.NewRecorder()
+	srv1.Handler().ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("server 1 add: %d %s", rec1.Code, rec1.Body)
+	}
+
+	// Simulate restart: re-open stores and start server 2 on same dir
+	store2, _ := cart.Open(dir)
+	wlStore2, _ := wishlist.Open(dir)
+	srv2 := New(store2, cat, &fakeOrders{}, slog.New(slog.NewTextHandler(io.Discard, nil)), WithWishlist(wlStore2))
+
+	req2 := httptest.NewRequest("GET", "/wishlists/cust_persist", nil)
+	rec2 := httptest.NewRecorder()
+	srv2.Handler().ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("server 2 get: %d %s", rec2.Code, rec2.Body)
+	}
+	m := asMap(t, rec2)
+	items := m["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["product_id"] != "prd_lamp" || int(items[0].(map[string]any)["quantity"].(float64)) != 3 {
+		t.Fatalf("restored wishlist unexpected: %+v", m)
+	}
+	if _, hasName := items[0].(map[string]any)["name"]; hasName {
+		t.Errorf("restored wishlist response must not contain name field: %+v", items[0])
+	}
+}
+
+func TestMissingWishlistStoreConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	store, err := cart.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := &fakeCatalog{known: map[string]string{"prd_lamp": "Desk lamp"}}
+	// Server instantiated WITHOUT WithWishlist option
+	srv := New(store, cat, &fakeOrders{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := srv.Handler()
+
+	doReq := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	for _, c := range [][3]string{
+		{"GET", "/wishlists/cust_1", ""},
+		{"PUT", "/wishlists/cust_1/items/prd_lamp", `{"quantity":1}`},
+		{"DELETE", "/wishlists/cust_1/items/prd_lamp", ""},
+		{"DELETE", "/wishlists/cust_1", ""},
+	} {
+		rec := doReq(c[0], c[1], c[2])
+		wantProblem(t, rec, http.StatusInternalServerError, "internal")
 	}
 }
 

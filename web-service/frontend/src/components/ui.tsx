@@ -125,7 +125,13 @@ export function Notice({ tone, title, children }: { tone: Tone; title: string; c
   );
 }
 
-export function Icon({ name, className = "h-5 w-5" }: { name: "cart" | "box" | "shield" | "plus" | "minus" | "trash" | "check"; className?: string }) {
+export function Icon({
+  name,
+  className = "h-5 w-5",
+}: {
+  name: "cart" | "box" | "shield" | "plus" | "minus" | "trash" | "check" | "heart";
+  className?: string;
+}) {
   const paths: Record<string, string> = {
     cart: "M3 4h2l2 11h11l2-8H6M9 20a1 1 0 1 0 0-2 1 1 0 0 0 0 2zm9 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
     box: "M21 8l-9-5-9 5m18 0v8l-9 5m9-13l-9 5m0 8l-9-5V8m9 13v-8M3 8l9 5",
@@ -134,6 +140,7 @@ export function Icon({ name, className = "h-5 w-5" }: { name: "cart" | "box" | "
     minus: "M5 12h14",
     trash: "M4 7h16M10 11v6m4-6v6M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12M9 7V4h6v3",
     check: "M5 12l4 4 10-10",
+    heart: "M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.8-7.5 1.1-1.1a5.5 5.5 0 0 0-.1-7.8z",
   };
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
