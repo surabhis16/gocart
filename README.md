@@ -6,7 +6,7 @@ An e-commerce system built as five Go microservices behind a React storefront, w
 
 - **Product service** owns the catalogue and the stock that others reserve.
 - **Order service** owns orders. It is event sourced: an order is the list of things that happened to it, and its state is whatever replaying them gives. It runs the saga: reserve stock, take payment, and give everything back if the order does not complete. Its events live in a file or in Cassandra, and two replicas stay consistent through a change feed.
-- **Cart service** owns what a customer intends to buy. Its checkout turns a cart into exactly one order, however many times the button is pressed or the network drops. A cart holds no prices, because the Product service owns those.
+- **Cart service** owns what a customer intends to buy. Its checkout turns a cart into exactly one order, however many times the button is pressed or the network drops. A cart holds no prices, because the Product service owns those. The same service keeps each customer's wishlist (save for later, move to cart).
 - **Payment service** owns charges. A mock card network approves, declines or fails depending on the payment token, so the hard cases can be produced on demand. Card data is never stored.
 - **Web service** is the gateway. It serves the React storefront and the admin console from one binary, does the OpenID Connect sign-in, and is the only door from a browser to the four services above, forwarding a short allow-list of routes.
 
@@ -18,7 +18,7 @@ An e-commerce system built as five Go microservices behind a React storefront, w
 - **Identity done properly.** Authorization-code flow with PKCE through Dex (which fronts Google and GitHub), RS256 token verification, signed stateless sessions, CSRF protection, and a short-lived signed identity the gateway passes on so the Order and Cart services enforce ownership themselves.
 - **Contracts.** OpenAPI 3.0.3 for every service, enforced by a route-drift test; RFC 9457 problem documents; front-end types generated from the specs.
 - **Production-shaped delivery.** Hardened pods, default-deny NetworkPolicies, a Traefik edge with cert-manager HTTPS and rate limits, Kustomize overlays, Terraform for the registry, logs and CI permissions, and GitHub Actions for test, release and end-to-end runs.
-- **Observability.** Structured JSON logs, a request id carried across all five services, and Prometheus metrics on each.
+- **Observability.** Structured JSON logs, a request id carried across all five services, Prometheus metrics on each, and an optional Prometheus and Grafana stack with a provisioned dashboard and alert rules (`make observe`): the outage demo shows up as a live graph.
 - **Dependency-free back end.** The five Go services use the standard library only: nothing to download, nothing to patch, and a static binary of about 6.5 MB in an empty `scratch` image.
 
 ## Tech stack
@@ -33,15 +33,17 @@ An e-commerce system built as five Go microservices behind a React storefront, w
 | Orchestration | Kubernetes, Kustomize, Traefik, cert-manager |
 | Infrastructure as code | Terraform (or OpenTofu), AWS ECR, CloudWatch, IAM |
 | CI/CD | GitHub Actions, `ghcr.io` |
+| Observability | Prometheus, Grafana |
 
 ## Quick start
 
 ```
 docker compose up --build        # open http://localhost:3000 and press Sign in (accounts and Google/GitHub setup: docs/operations.md)
                                  # Product :8080, Order :8081, Payment :8082, Cart :8083
-./scripts/smoke.sh               # 99 checks across all five services
+./scripts/smoke.sh               # 123 checks across all five services
 ./scripts/oversell-demo.sh       # many buyers, little stock
 ./scripts/outage-demo.sh         # Product down, then Payment down
+make observe                     # the same stack plus Grafana (:3001) and Prometheus (:9090)
 ```
 
 ![Architecture](docs/diagrams/context.png)
@@ -56,6 +58,7 @@ gocart-umbrella/
 ├── cart-service/             Go module: carts, retry-safe checkout
 ├── web-service/              Go gateway (OIDC, sessions) + frontend/ (React, TypeScript, Vite, Tailwind); see frontend/DESIGN.md
 ├── infra/
+│   ├── observability/        Prometheus config, alert rules, Grafana dashboard (provisioned)
 │   ├── terraform/            AWS resources as code (plan runs offline, free)
 │   └── k8s/                  Kustomize
 │       ├── base/             services, NetworkPolicies, Dex (config and GoCart theme)
@@ -71,7 +74,7 @@ gocart-umbrella/
 │   ├── openapi/              product.yaml, order.yaml, payment.yaml, cart.yaml
 │   └── diagrams/             Mermaid sources, rendered to SVG and PNG
 ├── scripts/                  smoke, oversell-demo, outage-demo, ship, cleanup, bump-version, check-k8s, mint
-├── docker-compose.yml        + docker-compose.cassandra.yml
+├── docker-compose.yml        + docker-compose.cassandra.yml, docker-compose.observability.yml
 ├── .env.example              sign-in settings for Compose
 ├── .github/workflows/        ci.yml, release.yml
 └── Makefile                  `make help`
@@ -81,9 +84,9 @@ gocart-umbrella/
 
 | Area | Verified |
 |---|---|
-| Go back end | 279 tests (331 with subtests) across five modules under `-race`, with `gofmt` and `go vet` clean |
-| Front end | 25 tests, type-check, lint, production build, generated API types up to date |
-| Whole system | `smoke.sh`: 99 checks on the five services running together, covering orders, payments, carts, ownership between customers, the gateway's sessions and CSRF, admin gating and metrics |
+| Go back end | 295 tests (354 with subtests) across five modules under `-race`, with `gofmt` and `go vet` clean |
+| Front end | 53 tests, type-check, lint, production build, generated API types up to date |
+| Whole system | `smoke.sh`: 123 checks on the five services running together, covering orders, payments, carts, wishlists, ownership between customers, the gateway's sessions and CSRF, admin gating and metrics |
 | Concurrency and failure | Oversell demo (exactly 3 sold, 3 charged); outage demo (order completes by itself: `StockReserved` 10.8 s after `OrderPlaced`, `PaymentCaptured` 10.9 s after `StockReserved`, at a 1 s reconcile interval and 10 s grace); checkout while the Order service is down, then recovered, gives one order |
 | Browser flows | Storefront (browse, cart, pay, receipt, admin, system page, phone width), and sign-in with two customers unable to see each other's cart or orders, the admin gate, sign-out |
 | Sign-in on Kubernetes | The full flow through Traefik and Dex with demo accounts, Google and GitHub |

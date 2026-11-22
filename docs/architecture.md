@@ -18,7 +18,7 @@ Four services, each in its own bounded context, each owning its own data. The Or
 | Edge and network | Traefik with a cert-manager certificate, per-address rate limits, NetworkPolicies that admit only real callers |
 | Infrastructure as code | Terraform for ECR repositories, CloudWatch log groups and a least-privilege CI policy |
 | Delivery | GitHub Actions (test matrix, Cassandra, front end, infrastructure, end-to-end), a release workflow to `ghcr.io`, one-command version bumps and staging deploys |
-| Observability | Structured JSON logs, a request id carried across all five services, Prometheus metrics on every service |
+| Observability | Structured JSON logs, a request id carried across all five services, Prometheus metrics on every service, and a provisioned Prometheus and Grafana stack with alert rules |
 
 ### How a request travels
 
@@ -53,7 +53,7 @@ Using the four team types and three interaction modes from *Team Topologies* (Sk
 | **Checkout** | stream-aligned | Order service, its event log and read model | Catalog via **X-as-a-Service** (the Product API) |
 | **Catalog** | stream-aligned | Product service and its data | Checkout via the same API, which it treats as a product with consumers |
 | **Payments** | stream-aligned, but in practice close to a *complicated-subsystem* team | Payment service, the provider integration and the ledger | Checkout via X-as-a-Service. Provider integrations are specialist work (money, regulation, fraud), which is the usual reason to give payments its own team |
-| **Shopping** | stream-aligned | Cart service: what a customer intends to buy, and the checkout call | Checkout via X-as-a-Service (the Order API), Catalog via the Product API |
+| **Shopping** | stream-aligned | Cart service: what a customer intends to buy now (the cart, and the checkout call) or later (the wishlist) | Checkout via X-as-a-Service (the Order API), Catalog via the Product API |
 | **Platform** | platform | pipeline, Terraform, Kubernetes manifests, the container registry | both, via **X-as-a-Service** (a paved road, not tickets) |
 
 Two additions in practice. For the first few weeks, while the reservation contract is still being found, Checkout and Catalog would use **collaboration** mode, working side by side; once it settles it hardens into X-as-a-Service, and that is the moment to freeze `openapi/product.yaml` behind versioning. And Platform's job is to make the right thing the easy thing: `scripts/ship.sh` and the CI workflows are that, in miniature.
@@ -213,6 +213,19 @@ The Cart service is small on purpose. Its whole job is to remember what a custom
 - **An edit made while checkout is in flight is never lost**, and is never mislabelled as part of the order: marking a cart as ordered only happens if its revision is still the one that was sent.
 - **Checkout passes the Order service's answer through**, status and body, so `402`, `409` and `202` reach the customer exactly as the Order service said them. The Cart service does not restate that contract; its spec points at the Order spec.
 
+### Wishlists: save for later
+
+The same service owns the wishlist, because it is the same idea held for longer: what a customer intends to buy, later. It follows the cart's rules and shares none of its machinery.
+
+- **A wishlist holds product ids and quantities, nothing else.** No name, no price, no stock level: those belong to the Product service and would go stale. Each item carries an `added_at` time, and the list comes back sorted by product id.
+- **It is separate from the cart and from checkout.** A wishlist has no revision and no idempotency key, and it can never change what an order contains. Moving an item to the cart is two ordinary calls from the page (set the cart line, then remove the wishlist item).
+- **Adding checks the product exists, only the first time**, exactly as for carts: an unknown product is `422`, an outage of the Product service is `503`, and changing the quantity of an item already saved needs no lookup, so it works through an outage.
+- **Small, enforced limits:** a quantity from 1 to 100 (`PUT` with no body saves one), at most 100 lines, and product ids of 1 to 64 safe characters. Anything else is a `422` problem document.
+- **Safe to repeat.** `PUT` states the quantity wanted, removing an absent item and clearing an empty list both succeed, so a retry changes nothing.
+- **Stored in its own file** (`wishlists.json`, written atomically) next to the carts, in the Cart service's own data directory. No other service reads it.
+- **Owned by one person.** The routes are `GET` and `DELETE /wishlists/{customer_id}` and `PUT` and `DELETE /wishlists/{customer_id}/items/{product_id}`, behind the same sign-in and the same ownership rule as carts: a stranger gets `403`, no identity gets `401`, and the gateway refuses changes without the CSRF header.
+- **In the storefront**, a heart on each product saves it, a *Wishlist* page lists the saved items with their current name, price and availability (items whose product has disappeared can only be removed), and the cart has *Move to Wishlist*.
+
 ## The web gateway and the storefront
 
 The browser talks to one origin, the Web service, and never to the four services directly.
@@ -247,7 +260,7 @@ Three questions are kept apart: *who is this* (an identity provider answers), *m
 | **Messaging** | A broker (NATS or Kafka) and a transactional outbox in place of the polling reconciler and change feed, plus a notifications service |
 | **Identity** | A server-side session table for instant sign-out, per-person admin roles verified by the services, mutual TLS between services |
 | **Secrets** | An external secrets manager with rotation, in place of Kubernetes Secrets |
-| **Observability** | Prometheus and Grafana dashboards with alerts, central logs, and OpenTelemetry traces built on the existing request id |
+| **Observability** | Prometheus and Grafana on Kubernetes (they run under Compose), alert delivery through Alertmanager, central logs, and OpenTelemetry traces built on the existing request id |
 | **Resilience** | Autoscaling, pod disruption budgets, and resource limits tuned from load tests |
 | **Delivery** | Image scanning and signing, and GitOps with Argo CD or Flux in place of `ship.sh`; applying the Terraform to a cloud account |
 | **Catalogue and carts** | A database for the catalogue as it grows; short-lived stock reservation when an item is added to a cart |

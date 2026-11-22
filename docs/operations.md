@@ -10,6 +10,7 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 | Terraform (or OpenTofu) | infrastructure as code | free to use; Terraform is source-available (BSL), and **OpenTofu** is the open-source drop-in, where you type `tofu` for `terraform` |
 | GitHub Actions + ghcr.io | CI and the container registry | free for public repositories; private repositories get a free monthly allowance |
 | Traefik, cert-manager, Dex | HTTPS edge and sign-in on Kubernetes | free, open source |
+| Prometheus, Grafana | metrics, dashboards and alert rules under Compose | free, open source |
 
 ## Run it
 
@@ -41,7 +42,7 @@ You will see `OrderPlaced`, `StockReserved`, `PaymentCaptured`. The payment toke
 
 Three scripts exercise it end to end (use a fresh stack for `smoke.sh`: `docker compose down -v`):
 
-- `./scripts/smoke.sh`: 99 checks across all five services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), shipped then delivered, admin endpoints refused without the key, ownership (a stranger gets `403` on a cart and `404` on an order), the gateway's sign-in session and CSRF checks, the gateway serving the app and refusing internal routes, metrics present.
+- `./scripts/smoke.sh`: 123 checks across all five services: confirmed, retried, rejected, declined, flaky card, cancelled and refunded, cart and checkout (a declined card keeps the cart, a repeated checkout is one order), wishlists (save, change quantity, limits, remove, clear), shipped then delivered, admin endpoints refused without the key, ownership (a stranger gets `403` on a cart or wishlist and `404` on an order), the gateway's sign-in session and CSRF checks, the gateway serving the app and refusing internal routes, metrics present.
 - `./scripts/oversell-demo.sh`: 20 customers each click "buy" twice at the same instant, for 3 lamps. It checks that exactly 3 orders were confirmed, stock ended at 0, exactly 3 charges were taken and no double-click was charged twice. It sets the stock itself, so it can be re-run.
 - `./scripts/outage-demo.sh`: two acts. The Product service goes down mid-order, then the Payment service does; each time the order is accepted (`202`), and finishes by itself when the service returns, with stock reserved once and money taken once.
 
@@ -67,7 +68,7 @@ Data goes to `./data` in each directory. Configuration is by environment variabl
 make test
 ```
 
-Format check, `go vet` and the race detector for all five Go modules: 279 tests (331 counting subtests). The front end has its own (`cd web-service/frontend && npm test`: 25 tests, run in CI with type-check, lint, build and a check that the generated API types match the specs). The Cassandra tests compile with `-tags cassandra` and run against a live Cassandra; see below.
+Format check, `go vet` and the race detector for all five Go modules: 295 tests (354 counting subtests). The front end has its own (`cd web-service/frontend && npm test`: 25 tests, run in CI with type-check, lint, build and a check that the generated API types match the specs). The Cassandra tests compile with `-tags cassandra` and run against a live Cassandra; see below.
 
 ## Developer workspace
 
@@ -329,6 +330,28 @@ curl -s localhost:8081/metrics | grep gocart_
 ```
 
 The two to watch are in the Order service: `gocart_orders_pending_work` with `kind` `placed` or `awaiting_payment` (something downstream is unavailable), and with `kind` `stock_release` or `refund` (a compensation is not landing). All four are the reconciler's backlog, and all should drain to zero.
+
+### Dashboards and alerts: Prometheus and Grafana
+
+The `/metrics` endpoints feed Prometheus and Grafana, added to the stack as an optional Compose file:
+
+```
+make observe
+# or: docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
+```
+
+Grafana is on <http://localhost:3001> (user `admin`, password `gocart-demo`, or `GRAFANA_ADMIN_PASSWORD`) and opens on the **GoCart overview** dashboard; Prometheus is on <http://localhost:9090>. Both are provisioned from files in `infra/observability/`, so there is nothing to click through: the Prometheus data source, the dashboard and the alert rules come up with the containers.
+
+| Dashboard section | What it shows |
+|---|---|
+| Top row | services up (of 5), orders waiting on the reconciler, total orders, products out of stock, units in stock, firing alerts |
+| The order pipeline | orders by status, the reconciler backlog by kind, charges by status, carts, stock units |
+| Traffic and health | requests per second, 5xx per second, p95 latency per service, responses by status code, the busiest routes |
+| Sign-in and rejections | sign-ins by result, identity assertions refused, admin keys rejected |
+
+Run `./scripts/outage-demo.sh` with the dashboard open: **Reconciler backlog by kind** climbs when the Product or Payment service goes down and drains to zero when it returns, and `ServiceDown` fires after 15 seconds of an outage and clears when the service returns (`OrdersStuck` fires if an outage lasts over a minute). The rules are in `infra/observability/rules.yml` (service down, orders stuck, compensation not landing, 5xx above 5%, identity rejections) and are visible under Alerts in Prometheus; nothing is sent anywhere.
+
+Prometheus scrapes every five seconds and keeps seven days. Both containers listen on this machine only; to reach them from another machine (a VM, say), set `OBSERVE_BIND=0.0.0.0` and change the Grafana password first.
 
 ## Measuring progress
 

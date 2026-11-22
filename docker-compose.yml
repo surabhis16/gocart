@@ -18,11 +18,11 @@ x-identity: &identity-secret ${IDENTITY_SECRET:-dev-identity-secret-change-me-01
 x-session: &session-secret ${SESSION_SECRET:-dev-session-secret-change-me-0123456789}
 x-oidc-client: &oidc-client-secret ${OIDC_CLIENT_SECRET:-dev-oidc-client-secret}
 
-x-version: &version ${VERSION:-0.5.0}
+x-version: &version ${VERSION:-0.6.0}
 
 services:
   product-service:
-    image: gocart/product-service:${VERSION:-0.5.0}
+    image: gocart/product-service:${VERSION:-0.6.0}
     build:
       context: ./product-service
       args:
@@ -37,7 +37,7 @@ services:
     # Each service owns its data: there is no database both can reach.
 
   order-service:
-    image: gocart/order-service:${VERSION:-0.5.0}
+    image: gocart/order-service:${VERSION:-0.6.0}
     build:
       context: ./order-service
       args:
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
   cart-service:
-    image: gocart/cart-service:${VERSION:-0.5.0}
+    image: gocart/cart-service:${VERSION:-0.6.0}
     build:
       context: ./cart-service
       args:
@@ -84,7 +84,7 @@ services:
     restart: unless-stopped
 
   web-service:
-    image: gocart/web-service:${VERSION:-0.5.0}
+    image: gocart/web-service:${VERSION:-0.6.0}
     build:
       context: ./web-service
       args:
@@ -135,7 +135,7 @@ services:
     restart: unless-stopped
 
   payment-service:
-    image: gocart/payment-service:${VERSION:-0.5.0}
+    image: gocart/payment-service:${VERSION:-0.6.0}
     build:
       context: ./payment-service
       args:

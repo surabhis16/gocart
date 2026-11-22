@@ -1,3 +1,11 @@
+# Changes in 0.6.0 (from 0.5.0)
+
+An optional Prometheus and Grafana stack: `make observe`. Prometheus scrapes the five existing `/metrics` endpoints; Grafana opens on a provisioned **GoCart overview** dashboard (order pipeline, reconciler backlog, traffic, latency, 5xx, sign-ins). Five alert rules are in `infra/observability/rules.yml`. No service code changed.
+
+Also documented: the **wishlist** added to the Cart service and the storefront (a heart on products, a Wishlist page, Move to Wishlist from the cart). `docs/architecture.md` has a "Wishlists" section, `docs/seed.md` a new job (J18) and its operations, and the smoke test checks it (123 checks in all, passing). Files: `docker-compose.observability.yml`, `infra/observability/`, a `make observe` target, a compose check in CI, and a section in `docs/operations.md`.
+
+**Verified.** `smoke.sh` passes all 123 checks, wishlist included; 295 Go tests (354 with subtests) and 53 front-end tests pass. Every dashboard query returns data from a real Prometheus scraping the five running services; an induced Payment outage raises `gocart_orders_pending_work` and it drains to zero on recovery; `ServiceDown` fires 15 seconds into an outage and clears on recovery; the compose files merge cleanly (`docker compose config`); the rules pass `promtool`.
+
 # Changes in 0.5.0 (from 0.4.0)
 
 Adds real sign-in, a landing page, and an HTTPS edge. Customer identity is now verified, and every cart and order belongs to its owner.

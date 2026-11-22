@@ -6,7 +6,7 @@ Where each topic of the Microservices Architecture syllabus (Units I to V) is co
 |---|---|---|---|
 | I | What are microservices; reducing coordination costs | [architecture.md](architecture.md#what-makes-these-microservices) | separate modules, no shared code or data, one written-down contract |
 | I | Team topologies and the operating model | [architecture.md](architecture.md#team-topology) | stream-aligned and platform teams, with interaction modes |
-| I | SEED(S): actors, jobs, sequence diagrams | [seed.md](seed.md) | actors, 17 jobs, 4 sequence diagrams and a state machine |
+| I | SEED(S): actors, jobs, sequence diagrams | [seed.md](seed.md) | actors, 18 jobs, 4 sequence diagrams and a state machine |
 | I | Actions and queries from jobs; open-standard specification | [openapi/](openapi) | OpenAPI 3.0.3 for the four back-end services, enforced by a test |
 | I | Microservices versus APIs | [seed.md](seed.md#microservices-versus-apis) | API as contract, microservice as independently deployable unit |
 | II | Service boundaries, domain-driven design, event storming | [architecture.md](architecture.md#boundaries) | four bounded contexts that each mean something different by "order" and "product" |
@@ -22,7 +22,7 @@ Where each topic of the Microservices Architecture syllabus (Units I to V) is co
 | IV | **Kubernetes** | `infra/k8s/` | Kustomize base and overlays, hardened pods, NetworkPolicies |
 | IV | Designing endpoints; second microservice; **umbrella project** | this repository | one repo, `go.work`, five independently built services |
 | IV | API gateway and front end (extra) | [architecture.md](architecture.md#the-web-gateway-and-the-storefront), `web-service/` | allow-listed gateway, embedded React app, types generated from the OpenAPI files |
-| IV | Identity, edge and observability (extra) | [architecture.md](architecture.md#who-is-asking-sign-in-and-ownership), [operations.md](operations.md#admin-key-and-metrics) | OIDC with PKCE through Dex, Traefik with HTTPS and rate limits, `/metrics` on every service |
+| IV | Identity, edge and observability (extra) | [architecture.md](architecture.md#who-is-asking-sign-in-and-ownership), [operations.md](operations.md#dashboards-and-alerts-prometheus-and-grafana) | OIDC with PKCE through Dex, Traefik with HTTPS and rate limits, `/metrics` on every service, Prometheus and Grafana dashboards with alert rules |
 | V | Staging environment, shipping and deploying the container, clean up | `scripts/ship.sh`, `scripts/cleanup.sh`, `release.yml` | registry flow into a `gocart-staging` namespace |
 | V | Managing change | [operations.md](operations.md#managing-change) | additive, breaking and stored-data changes, each handled differently |
 | V | Complexity and simplification; measuring progress | [operations.md](operations.md#measuring-progress) | delivery and coordination metrics, with measured recovery times |

@@ -44,6 +44,7 @@ Each job is written as "When ..., I want to ..., so I can ...". They are about o
 
 **Shopper**
 - J17. When I arrive, I want to sign in with an account I already have (Google, GitHub), so my cart and orders are mine and nobody else can see them.
+- J18. When I like something but am not ready to buy, I want to save it for later and come back to it, so I can decide at my own pace.
 - J15. When I am deciding, I want to put products in a cart and change my mind, so I can buy them together.
 - J16. When I check out, I want one order even if I click twice or the network drops, so I am never charged twice.
 
@@ -92,6 +93,8 @@ An **action** changes state; a **query** only reads it. Splitting them this way 
 | J15 | action | `PUT /carts/{customer_id}/items/{product_id}`, `DELETE` of an item or of the cart | Cart |
 | J15 | query | `GET /carts/{customer_id}` | Cart |
 | J16 | action | `POST /carts/{customer_id}/checkout` (retry-safe; calls `POST /orders`) | Cart |
+| J18 | action | `PUT /wishlists/{customer_id}/items/{product_id}`, `DELETE` of an item or of the wishlist | Cart |
+| J18 | query | `GET /wishlists/{customer_id}` | Cart |
 | J5 | action | `POST /products` | Product |
 | J6 | action | `PUT /products/{id}/stock` | Product |
 | J3 (browse) | query | `GET /products`, `GET /products/{id}` | Product |
@@ -100,6 +103,8 @@ An **action** changes state; a **query** only reads it. Splitting them this way 
 | J12 | action | `POST /charges` (idempotent per order) | Payment |
 | J13 | action | `DELETE /charges/{order_id}` (void or refund) | Payment |
 | J11 | query | `GET /charges/{order_id}` (admin) | Payment |
+
+J18 lives in the Cart service rather than a service of its own: a wishlist is what a customer intends to buy, held for longer, so it changes with the cart and is owned by the same team. It stores product ids only, never prices, for the same reason a cart does.
 
 Two details worth noticing. J2 turned into a header on an existing action rather than a new endpoint: retries are a property of how an action is called, not a separate job. J9 and J13 are `DELETE` because releasing and voiding are naturally repeatable: doing either twice is a success, which is what lets the Order service retry them safely. J13 has one extra property worth the thought it took: voiding a charge that does not exist *yet* records a tombstone, so a charge request that was already on its way when the order was abandoned can never succeed afterwards.
 

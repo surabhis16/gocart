@@ -22,9 +22,14 @@ up: ## Build and start all five services with Docker Compose
 up-cassandra: ## Same, with Cassandra as the Order service's event store
 	docker compose -f docker-compose.yml -f docker-compose.cassandra.yml up -d --build --wait --wait-timeout 300
 
+.PHONY: observe
+observe: ## Same as `up`, plus Prometheus (:9090) and Grafana (:3001)
+	docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build --wait
+	@echo "Grafana http://localhost:3001 (admin / gocart-demo)   Prometheus http://localhost:9090"
+
 .PHONY: down
 down: ## Stop everything and delete its data
-	docker compose -f docker-compose.yml -f docker-compose.cassandra.yml down -v --remove-orphans
+	docker compose -f docker-compose.yml -f docker-compose.cassandra.yml -f docker-compose.observability.yml down -v --remove-orphans
 
 .PHONY: smoke
 smoke: ## End-to-end checks against a fresh running stack

@@ -1,0 +1,41 @@
+# Alert rules. They show up under Alerts in Prometheus and in the Grafana
+# dashboard's "Alerts" panel; nothing is sent anywhere (no Alertmanager here).
+groups:
+  - name: gocart
+    rules:
+      - alert: ServiceDown
+        expr: up{job="gocart"} == 0
+        for: 15s
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.instance }} is not answering"
+
+      - alert: OrdersStuck
+        expr: sum(gocart_orders_pending_work) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Orders are waiting for the reconciler: a service they depend on is probably down"
+
+      - alert: CompensationNotLanding
+        expr: sum(gocart_orders_pending_work{kind=~"stock_release|refund"}) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "A stock release or a refund is not completing"
+
+      - alert: HighServerErrorRate
+        expr: |
+          sum by (service) (rate(gocart_http_requests_total{code=~"5.."}[1m]))
+            / sum by (service) (rate(gocart_http_requests_total[1m])) > 0.05
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }} is answering more than 5% of requests with a 5xx"
+
+      - alert: IdentityRejections
+        expr: increase(gocart_identity_failures_total[5m]) > 10
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }} refused many identity assertions: a wrong secret, or someone forging headers"
