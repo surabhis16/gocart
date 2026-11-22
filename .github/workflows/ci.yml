@@ -129,6 +129,7 @@ jobs:
         run: |
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.cassandra.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.observability.yml config --quiet
 
   # The real thing: build the images, start them, and drive them over HTTP,
   # including taking the Product and Payment services away mid-flow.
