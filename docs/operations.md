@@ -11,6 +11,7 @@ Everything here is free to run. Nothing needs a cloud account, a licence key or 
 | GitHub Actions + ghcr.io | CI and the container registry | free for public repositories; private repositories get a free monthly allowance |
 | Traefik, cert-manager, Dex | HTTPS edge and sign-in on Kubernetes | free, open source |
 | Prometheus, Grafana | metrics, dashboards and alert rules under Compose | free, open source |
+| Caddy | automatic HTTPS in front of the Compose stack on a public host | free, open source |
 
 ## Run it
 
@@ -207,6 +208,40 @@ For a release outside your machine, pushing a tag such as `v0.2.0` makes `releas
 ```
 
 Deletes the `gocart-staging` and `gocart-local` namespaces (which removes Deployments, Services, volumes and Cassandra with them), stops the registry port-forward, removes the local images, and runs `docker compose down -v`. "Clean up" should leave nothing running.
+
+## Hosting on Azure over HTTPS
+
+The same containers that CI tests and the release publishes run on one Azure VM, behind HTTPS, with one command to create it and one to remove it.
+
+```
+git clone https://github.com/surabhis16/gocart.git && cd gocart     # in Azure Cloud Shell
+./scripts/azure-demo.sh up mygocart        # https://mygocart.indiasouthcentral.cloudapp.azure.com
+./scripts/azure-demo.sh status
+./scripts/azure-demo.sh down
+```
+
+| Piece | What it does |
+|---|---|
+| Azure DNS name | every public IP can have a free `<name>.<region>.cloudapp.azure.com` name, so no domain is needed |
+| Caddy (`docker-compose.https.yml`) | listens on 80 and 443, gets and renews a Let's Encrypt certificate by itself, redirects http to https, sends `/dex/*` to Dex and everything else to the gateway, and adds HSTS |
+| One address, two services | the browser sees a single site: the shop at `/` and the sign-in page at `/dex`, which is the same layout the Kubernetes edge uses |
+| Closed by default | only ports 22, 80 and 443 are open in Azure, and the compose file binds every other published port (the four services, the gateway, Dex) to `127.0.0.1` as well |
+| Release images (`docker-compose.ghcr.yml`) | the VM pulls the `ghcr.io` images the release published for this version instead of building, so what runs is what was released |
+| Fresh secrets | `up` generates random session, identity, admin and sign-in secrets into the VM's `.env`; the demo defaults in the repository are never used |
+| `.env` and `COMPOSE_FILE` | the VM's `.env` also names the compose files, so `docker compose ps`, `logs` and `down` work there without any `-f` flags |
+
+Because the address is real HTTPS, **Google and GitHub sign-in work on Azure**: register `https://<host>/dex/callback` (the script prints it), then run with the keys set, for example:
+
+```
+DEX_DEMO_USERS=false ADMIN_EMAILS=you@example.com \
+GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... ./scripts/azure-demo.sh up mygocart
+```
+
+The demo accounts are on by default so a first run needs no setup; their password is published in the repository, so turn them off (`DEX_DEMO_USERS=false`) for anything left running. Other settings: `RG`, `LOCATION`, `SIZE`, `REF` (the git tag to deploy, default the current release), and `BUILD=1` to build on the VM. `DRY_RUN=1` prints the start-up script and the Azure commands without running them. Allow 5 to 10 minutes after `up` for Docker to install and the images to pull; Caddy then obtains the certificate on the first request.
+
+The same overlay works anywhere with a public name and ports 80 and 443: set `PUBLIC_HOST` in `.env` and add `-f docker-compose.https.yml`. With `PUBLIC_HOST=localhost`, Caddy serves a locally trusted certificate, which is how to try it on a laptop first.
+
+**Verified.** The merged compose files expose only ports 80 and 443; Dex and the gateway receive the https address for the issuer, the callback and the public URL; a real Caddy with this Caddyfile redirects http to https (`308`), sends `/dex/*` and `/` to different backends, and sets `Strict-Transport-Security`; the start-up script is valid cloud-init; `azure-demo.sh` passes `shellcheck` and a dry run.
 
 ## Managing change
 

@@ -6,6 +6,13 @@ Also documented: the **wishlist** added to the Cart service and the storefront (
 
 **Verified.** `smoke.sh` passes all 123 checks, wishlist included; 295 Go tests (354 with subtests) and 53 front-end tests pass. Every dashboard query returns data from a real Prometheus scraping the five running services; an induced Payment outage raises `gocart_orders_pending_work` and it drains to zero on recovery; `ServiceDown` fires 15 seconds into an outage and clears on recovery; the compose files merge cleanly (`docker compose config`); the rules pass `promtool`.
 
+
+# HTTPS hosting on Azure (on top of 0.6.0)
+
+`./scripts/azure-demo.sh up <name>` creates an Azure VM that serves GoCart at `https://<name>.<region>.cloudapp.azure.com`: Caddy gets a Let's Encrypt certificate, the VM pulls the published release images from ghcr.io, and only ports 22, 80 and 443 are open. Google and GitHub sign-in work there. `down` removes everything. Files: `docker-compose.https.yml`, `docker-compose.ghcr.yml`, `infra/caddy/Caddyfile`, `scripts/azure-demo.sh`, `PUBLIC_HOST` in `.env.example`, a CI check of the new compose files, and `bump-version.sh` now keeps the release images' version in step. See "Hosting on Azure over HTTPS" in `docs/operations.md`.
+
+**Verified.** The merged compose files expose only 80 and 443; a real Caddy redirects http to https, routes `/dex/*` and `/` to different backends and sets HSTS; the start-up script is valid cloud-init; the script passes `shellcheck` and a dry run; a version bump up and back leaves every file identical.
+
 # Changes in 0.5.0 (from 0.4.0)
 
 Adds real sign-in, a landing page, and an HTTPS edge. Customer identity is now verified, and every cart and order belongs to its owner.

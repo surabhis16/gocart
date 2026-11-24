@@ -19,6 +19,7 @@ An e-commerce system built as five Go microservices behind a React storefront, w
 - **Contracts.** OpenAPI 3.0.3 for every service, enforced by a route-drift test; RFC 9457 problem documents; front-end types generated from the specs.
 - **Production-shaped delivery.** Hardened pods, default-deny NetworkPolicies, a Traefik edge with cert-manager HTTPS and rate limits, Kustomize overlays, Terraform for the registry, logs and CI permissions, and GitHub Actions for test, release and end-to-end runs.
 - **Observability.** Structured JSON logs, a request id carried across all five services, Prometheus metrics on each, and an optional Prometheus and Grafana stack with a provisioned dashboard and alert rules (`make observe`): the outage demo shows up as a live graph.
+- **Hosted on Azure over HTTPS.** One command (`scripts/azure-demo.sh up`) creates a VM that runs the released images behind Caddy with a Let's Encrypt certificate and a free Azure DNS name; Google and GitHub sign-in work there, and only ports 80 and 443 are reachable.
 - **Dependency-free back end.** The five Go services use the standard library only: nothing to download, nothing to patch, and a static binary of about 6.5 MB in an empty `scratch` image.
 
 ## Tech stack
@@ -29,7 +30,7 @@ An e-commerce system built as five Go microservices behind a React storefront, w
 | Storage | Atomic JSON snapshots, append-only event log on file or Apache Cassandra |
 | Front end | React 19, TypeScript, Vite 6, Tailwind, TanStack Query, React Router, Vitest |
 | Identity | OpenID Connect, PKCE, Dex, Google and GitHub |
-| Containers | Docker multi-stage builds, Docker Compose |
+| Containers | Docker multi-stage builds, Docker Compose, Caddy (HTTPS) |
 | Orchestration | Kubernetes, Kustomize, Traefik, cert-manager |
 | Infrastructure as code | Terraform (or OpenTofu), AWS ECR, CloudWatch, IAM |
 | CI/CD | GitHub Actions, `ghcr.io` |
@@ -58,6 +59,7 @@ gocart-umbrella/
 ├── cart-service/             Go module: carts, retry-safe checkout
 ├── web-service/              Go gateway (OIDC, sessions) + frontend/ (React, TypeScript, Vite, Tailwind); see frontend/DESIGN.md
 ├── infra/
+│   ├── caddy/                Caddyfile for the HTTPS front door
 │   ├── observability/        Prometheus config, alert rules, Grafana dashboard (provisioned)
 │   ├── terraform/            AWS resources as code (plan runs offline, free)
 │   └── k8s/                  Kustomize
@@ -73,8 +75,8 @@ gocart-umbrella/
 │   ├── syllabus.md           mapping to the course syllabus
 │   ├── openapi/              product.yaml, order.yaml, payment.yaml, cart.yaml
 │   └── diagrams/             Mermaid sources, rendered to SVG and PNG
-├── scripts/                  smoke, oversell-demo, outage-demo, ship, cleanup, bump-version, check-k8s, mint
-├── docker-compose.yml        + docker-compose.cassandra.yml, docker-compose.observability.yml
+├── scripts/                  smoke, oversell-demo, outage-demo, ship, cleanup, bump-version, check-k8s, mint, azure-demo
+├── docker-compose.yml        + .cassandra.yml, .observability.yml, .https.yml (Caddy), .ghcr.yml (release images)
 ├── .env.example              sign-in settings for Compose
 ├── .github/workflows/        ci.yml, release.yml
 └── Makefile                  `make help`

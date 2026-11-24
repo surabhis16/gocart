@@ -1,0 +1,64 @@
+# HTTPS for a public host: a Caddy container in front of the stack.
+#
+#   # .env:  PUBLIC_HOST=<your public DNS name>        (for a laptop trial: PUBLIC_HOST=localhost)
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+#
+# What it does:
+#   - Caddy listens on 80 and 443 and gets a Let's Encrypt certificate for PUBLIC_HOST.
+#   - The gateway and Dex learn their public https address, so sign-in works with a real
+#     callback (https://<PUBLIC_HOST>/dex/callback for Google and GitHub), and the
+#     session cookie becomes Secure.
+#   - Nothing else is reachable from outside: every other published port is bound to
+#     127.0.0.1, so only this machine (a smoke run, an SSH tunnel) can use them.
+#
+# Needs a recent Docker Compose (the !override and !reset tags, 2.24 or newer).
+# Set real secrets in .env first (SESSION_SECRET, IDENTITY_SECRET, ADMIN_KEY,
+# OIDC_CLIENT_SECRET); the defaults are demo values anyone can read in the repository.
+name: gocart
+
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST in .env to the public DNS name}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # the certificate lives here: keep it across restarts
+      - caddy-config:/config
+    depends_on:
+      - web-service
+      - dex
+    restart: unless-stopped
+
+  web-service:
+    environment:
+      PUBLIC_URL: https://${PUBLIC_HOST:?set PUBLIC_HOST in .env}
+      OIDC_ISSUER: https://${PUBLIC_HOST}/dex
+    ports: !override
+      - "127.0.0.1:3000:3000"
+
+  dex:
+    environment:
+      DEX_ISSUER: https://${PUBLIC_HOST:?set PUBLIC_HOST in .env}/dex
+      GOCART_REDIRECT_URI: https://${PUBLIC_HOST}/auth/callback
+    ports: !reset []
+
+  product-service:
+    ports: !override
+      - "127.0.0.1:8080:8080"
+  order-service:
+    ports: !override
+      - "127.0.0.1:8081:8081"
+  payment-service:
+    ports: !override
+      - "127.0.0.1:8082:8082"
+  cart-service:
+    ports: !override
+      - "127.0.0.1:8083:8083"
+
+volumes:
+  caddy-data:
+  caddy-config:

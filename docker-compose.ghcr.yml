@@ -1,0 +1,27 @@
+# Run the published release images instead of building from source.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d --no-build
+#
+# The images are the ones release.yml publishes when a v* tag is pushed, so what runs
+# is exactly what was released (the Order service is the file-store build). The
+# packages must be public, or run `docker login ghcr.io` first.
+# GOCART_REGISTRY points at another registry or fork if needed.
+name: gocart
+
+services:
+  product-service:
+    image: ${GOCART_REGISTRY:-ghcr.io/surabhis16/gocart}/product-service:${VERSION:-0.6.0}
+    pull_policy: always
+  order-service:
+    image: ${GOCART_REGISTRY:-ghcr.io/surabhis16/gocart}/order-service:${VERSION:-0.6.0}
+    pull_policy: always
+  payment-service:
+    image: ${GOCART_REGISTRY:-ghcr.io/surabhis16/gocart}/payment-service:${VERSION:-0.6.0}
+    pull_policy: always
+  cart-service:
+    image: ${GOCART_REGISTRY:-ghcr.io/surabhis16/gocart}/cart-service:${VERSION:-0.6.0}
+    pull_policy: always
+  web-service:
+    image: ${GOCART_REGISTRY:-ghcr.io/surabhis16/gocart}/web-service:${VERSION:-0.6.0}
+    pull_policy: always

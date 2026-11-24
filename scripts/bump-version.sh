@@ -26,11 +26,11 @@ esc=${old//./\\.}
 sed -i.bak -E "s#(image: gocart/(product|order|payment|cart|web)-service:)${esc}\$#\1${new}#" infra/k8s/base/*.yaml
 sed -i.bak -E "s#(newTag: )${esc}\$#\1${new}#" infra/k8s/overlays/staging/kustomization.yaml
 sed -i.bak -E "s#(newTag: )${esc}-cassandra\$#\1${new}-cassandra#" infra/k8s/overlays/staging-cassandra/kustomization.yaml
-sed -i.bak -E "s#\\\$\{VERSION:-${esc}\}#\${VERSION:-${new}}#g" docker-compose.yml docker-compose.cassandra.yml
+sed -i.bak -E "s#\\\$\{VERSION:-${esc}\}#\${VERSION:-${new}}#g" docker-compose.yml docker-compose.cassandra.yml docker-compose.ghcr.yml
 
 printf '%s\n' "$new" > VERSION
 find infra/k8s -name '*.bak' -delete
-rm -f docker-compose.yml.bak docker-compose.cassandra.yml.bak
+rm -f docker-compose.yml.bak docker-compose.cassandra.yml.bak docker-compose.ghcr.yml.bak
 
 echo "$old -> $new"
 if python3 -c 'import kubernetes_validate, yaml' 2>/dev/null; then

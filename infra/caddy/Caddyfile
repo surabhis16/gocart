@@ -1,0 +1,24 @@
+# HTTPS front door for GoCart. Caddy gets and renews a Let's Encrypt certificate for
+# PUBLIC_HOST by itself (ports 80 and 443 must reach it), redirects http to https,
+# and sends each request to the right place:
+#
+#   /dex/*  ->  Dex, the sign-in page (same address, so the browser sees one site)
+#   the rest -> the web gateway (the storefront, /api, /auth)
+#
+# With PUBLIC_HOST=localhost it serves a locally trusted certificate instead
+{$PUBLIC_HOST} {
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	handle /dex/* {
+		reverse_proxy dex:5556
+	}
+
+	handle {
+		reverse_proxy web-service:3000
+	}
+}

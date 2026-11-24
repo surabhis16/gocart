@@ -15,7 +15,7 @@ Four services, each in its own bounded context, each owning its own data. The Or
 | Identity | OpenID Connect with PKCE (Dex, which fronts Google and GitHub), signed stateless session cookies, a short-lived signed identity the gateway passes to the services, ownership checks where the data lives |
 | Front end | React 19, TypeScript, Vite, Tailwind, TanStack Query, React Router, embedded into the gateway binary |
 | Packaging | Multi-stage Docker builds, Docker Compose, Kustomize overlays for Kubernetes |
-| Edge and network | Traefik with a cert-manager certificate, per-address rate limits, NetworkPolicies that admit only real callers |
+| Edge and network | Traefik with a cert-manager certificate on Kubernetes, and Caddy with a Let's Encrypt certificate on a single host (the Azure demo); per-address rate limits, NetworkPolicies that admit only real callers |
 | Infrastructure as code | Terraform for ECR repositories, CloudWatch log groups and a least-privilege CI policy |
 | Delivery | GitHub Actions (test matrix, Cassandra, front end, infrastructure, end-to-end), a release workflow to `ghcr.io`, one-command version bumps and staging deploys |
 | Observability | Structured JSON logs, a request id carried across all five services, Prometheus metrics on every service, and a provisioned Prometheus and Grafana stack with alert rules |
